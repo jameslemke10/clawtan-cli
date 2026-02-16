@@ -191,6 +191,17 @@ def _my_status(state: dict, color: str) -> dict | None:
     }
 
 
+def _all_player_resources(state: dict) -> dict:
+    """Return {color: {resource: count}} for every player."""
+    ps = state.get("player_state", {})
+    colors = state.get("colors", [])
+    result = {}
+    for i, c in enumerate(colors):
+        p = f"P{i}_"
+        result[c] = {r: ps.get(f"{p}{r}_IN_HAND", 0) for r in RESOURCES}
+    return result
+
+
 def _opponents(state: dict, color: str) -> list:
     ps = state.get("player_state", {})
     colors = state.get("colors", [])
@@ -534,10 +545,57 @@ def cmd_wait(args):
         print(f"\n  Robber: {robber}")
 
 
+def _print_roll_result(state: dict, pre_resources: dict | None):
+    """Show dice result and per-player resource gains after a roll."""
+    # Extract the roll value from the last action record
+    records = state.get("action_records", [])
+    roll_val = None
+    for r in reversed(records):
+        if isinstance(r, list) and len(r) >= 2 and r[1] == "ROLL_THE_SHELLS":
+            roll_val = r[2] if len(r) > 2 else None
+            break
+
+    if roll_val is not None:
+        if isinstance(roll_val, list) and len(roll_val) == 2:
+            print(f"  Rolled: {roll_val[0]} + {roll_val[1]} = {sum(roll_val)}")
+        else:
+            print(f"  Rolled: {roll_val}")
+
+    # Diff resources to show what was distributed
+    if pre_resources:
+        post_resources = _all_player_resources(state)
+        _section("Resources Distributed")
+        any_gains = False
+        for c in state.get("colors", []):
+            pre = pre_resources.get(c, {})
+            post = post_resources.get(c, {})
+            gains = []
+            for res in RESOURCES:
+                diff = post.get(res, 0) - pre.get(res, 0)
+                if diff > 0:
+                    gains.append(f"+{diff} {res}")
+                elif diff < 0:
+                    gains.append(f"{diff} {res}")
+            if gains:
+                any_gains = True
+                print(f"  {c}: {', '.join(gains)}")
+        if not any_gains:
+            print("  No resources produced.")
+
+
 def cmd_act(args):
     game_id = _env("GAME", args.game)
     token = _env("TOKEN", args.token)
     color = _env("COLOR", args.color)
+
+    # Snapshot resources before rolling so we can diff afterwards
+    pre_resources = None
+    if args.action == "ROLL_THE_SHELLS":
+        try:
+            pre_state = _get(f"/game/{game_id}")
+            pre_resources = _all_player_resources(pre_state)
+        except (APIError, Exception):
+            pass
 
     # Parse value: try JSON, fall back to bare string
     value = None
@@ -560,6 +618,10 @@ def cmd_act(args):
     # Re-fetch state so the agent knows what to do next
     state = _get(f"/game/{game_id}")
     current_color = state.get("current_color")
+
+    # After a roll, show the dice result and resource distribution
+    if args.action == "ROLL_THE_SHELLS":
+        _print_roll_result(state, pre_resources)
 
     if current_color == color:
         prompt = state.get("current_prompt", "?")
