@@ -277,26 +277,74 @@ def _print_opponents(opponents: list):
         print(line)
 
 
-def _print_actions(actions: list):
+_ACTION_HINTS = {
+    "RELEASE_CATCH": (
+        "Discard cards (freqdeck=[DRIFTWOOD,CORAL,SHRIMP,KELP,PEARL]).\n"
+        "    CLI: clawtan act RELEASE_CATCH '<freqdeck>'  e.g. clawtan act RELEASE_CATCH '[1,0,0,1,0]'"
+    ),
+    "MOVE_THE_KRAKEN": (
+        "Move robber: value = [coordinate, victim_color_or_null, null].\n"
+        "    CLI: clawtan act MOVE_THE_KRAKEN '[[0,1,-1],\"BLUE\",null]'"
+    ),
+    "OCEAN_TRADE": (
+        "Maritime trade: give 4 (or 3/2 with port) of one resource, receive 1.\n"
+        "    Value = list of resources: first N are given, last 1 is received.\n"
+        "    CLI: clawtan act OCEAN_TRADE '[\"KELP\",\"KELP\",\"KELP\",\"KELP\",\"SHRIMP\"]'"
+    ),
+    "PLAY_BOUNTIFUL_HARVEST": (
+        "Year of Plenty: pick 2 free resources.\n"
+        "    CLI: clawtan act PLAY_BOUNTIFUL_HARVEST '[\"DRIFTWOOD\",\"CORAL\"]'"
+    ),
+}
+
+
+def _print_actions(actions: list, my_color: str | None = None):
     _section("Available Actions")
-    grouped = defaultdict(list)
+
+    my_actions = []
+    other_colors = set()
     for a in actions:
+        if isinstance(a, list) and len(a) > 1:
+            action_color = a[0]
+            if my_color and action_color and action_color != my_color:
+                other_colors.add(action_color)
+                continue
+        my_actions.append(a)
+
+    if not my_actions and other_colors:
+        print(f"  (none for you -- waiting on: {', '.join(sorted(other_colors))})")
+        return
+
+    grouped = defaultdict(list)
+    for a in my_actions:
         atype = a[1] if isinstance(a, list) and len(a) > 1 else str(a)
         val = a[2] if isinstance(a, list) and len(a) > 2 else None
         grouped[atype].append(val)
 
     for atype, values in grouped.items():
+        hint = _ACTION_HINTS.get(atype)
         if all(v is None for v in values):
             print(f"  {atype}")
+            if hint:
+                print(f"    ({hint})")
         else:
             formatted = [json.dumps(v, separators=(",", ":")) for v in values]
-            joined = " | ".join(formatted)
-            if len(joined) + len(atype) + 4 <= 120:
-                print(f"  {atype}: {joined}")
-            else:
+            if hint:
                 print(f"  {atype} ({len(values)} options):")
+                print(f"    ({hint})")
                 for f in formatted:
                     print(f"    {f}")
+            else:
+                joined = " | ".join(formatted)
+                if len(joined) + len(atype) + 4 <= 120:
+                    print(f"  {atype}: {joined}")
+                else:
+                    print(f"  {atype} ({len(values)} options):")
+                    for f in formatted:
+                        print(f"    {f}")
+
+    if other_colors:
+        print(f"\n  (other players still need to act: {', '.join(sorted(other_colors))})")
 
 
 def _print_history(records: list, since: int = 0):
@@ -477,7 +525,7 @@ def cmd_wait(args):
 
     actions = state.get("current_playable_actions", [])
     if actions:
-        _print_actions(actions)
+        _print_actions(actions, my_color=color)
 
     robber = state.get("robber_coordinate")
     if robber:
@@ -522,7 +570,7 @@ def cmd_act(args):
 
         actions = state.get("current_playable_actions", [])
         if actions:
-            _print_actions(actions)
+            _print_actions(actions, my_color=color)
         else:
             print("\n  No actions available.")
     else:
