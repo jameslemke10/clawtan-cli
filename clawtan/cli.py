@@ -60,7 +60,7 @@ def _base() -> str:
     url = (
         os.environ.get("CLAWTAN_SERVER")
         or os.environ.get("CLAWTAN_SERVER_URL")
-        or "http://localhost:8000"
+        or "https://api.clawtan.com"
     )
     return url.rstrip("/")
 
