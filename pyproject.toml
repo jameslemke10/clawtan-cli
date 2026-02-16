@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clawtan-cli"
+version = "0.1.0"
+description = "CLI for AI agents playing Settlers of Clawtan"
+requires-python = ">=3.10"
+
+[project.scripts]
+clawtan = "clawtan.cli:main"

@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+"""
+clawtan -- CLI for AI agents playing Settlers of Clawtan.
+
+Every command prints structured text to stdout designed for easy scanning
+by LLM agents. Set environment variables for session persistence:
+
+    CLAWTAN_SERVER  Server URL (default: http://localhost:8000)
+    CLAWTAN_GAME    Game ID
+    CLAWTAN_TOKEN   Auth token from join
+    CLAWTAN_COLOR   Your player color
+
+Typical agent flow:
+    clawtan quick-join --name "LobsterBot"
+    export CLAWTAN_GAME=...  CLAWTAN_TOKEN=...  CLAWTAN_COLOR=...
+    clawtan board            # once, to learn the map
+    clawtan wait             # blocks until your turn
+    clawtan act ROLL_THE_SHELLS
+    clawtan act BUILD_TIDE_POOL 42
+    clawtan act END_TIDE
+    clawtan wait             # next turn...
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections import defaultdict
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+RESOURCES = ["DRIFTWOOD", "CORAL", "SHRIMP", "KELP", "PEARL"]
+DEV_CARDS = [
+    "LOBSTER_GUARD",
+    "BOUNTIFUL_HARVEST",
+    "TIDAL_MONOPOLY",
+    "CURRENT_BUILDING",
+    "TREASURE_CHEST",
+]
+
+
+# ---------------------------------------------------------------------------
+# Error type
+# ---------------------------------------------------------------------------
+class APIError(Exception):
+    def __init__(self, code: int, detail: str):
+        self.code = code
+        self.detail = detail
+        super().__init__(f"HTTP {code}: {detail}")
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+def _base() -> str:
+    url = (
+        os.environ.get("CLAWTAN_SERVER")
+        or os.environ.get("CLAWTAN_SERVER_URL")
+        or "http://localhost:8000"
+    )
+    return url.rstrip("/")
+
+
+def _req(method: str, path: str, data=None, token=None):
+    url = f"{_base()}{path}"
+    body = json.dumps(data).encode() if data is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = token
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        raise APIError(e.code, detail)
+    except urllib.error.URLError as e:
+        raise APIError(0, f"Cannot connect to {url}: {e.reason}")
+
+
+def _post(path, data=None, token=None):
+    return _req("POST", path, data, token)
+
+
+def _get(path, token=None):
+    return _req("GET", path, token=token)
+
+
+# ---------------------------------------------------------------------------
+# Environment variable helpers
+# ---------------------------------------------------------------------------
+def _env(name: str, arg_val=None, required=True):
+    val = arg_val or os.environ.get(f"CLAWTAN_{name}")
+    if required and not val:
+        print(
+            f"ERROR: Missing {name}. Pass --{name.lower()} or set CLAWTAN_{name}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return val
+
+
+# ---------------------------------------------------------------------------
+# State extraction (operates on a full game-state dict)
+# ---------------------------------------------------------------------------
+def _find_idx(colors: list, color: str) -> int:
+    try:
+        return colors.index(color)
+    except ValueError:
+        return -1
+
+
+def _my_status(state: dict, color: str) -> dict | None:
+    ps = state.get("player_state", {})
+    colors = state.get("colors", [])
+    idx = _find_idx(colors, color)
+    if idx < 0:
+        return None
+    p = f"P{idx}_"
+
+    resources = {}
+    total = 0
+    for r in RESOURCES:
+        c = ps.get(f"{p}{r}_IN_HAND", 0)
+        resources[r] = c
+        total += c
+
+    dev = {}
+    for d in DEV_CARDS:
+        c = ps.get(f"{p}{d}_IN_HAND", 0)
+        if c > 0:
+            dev[d] = c
+
+    return {
+        "color": color,
+        "vp": ps.get(f"{p}TREASURE_CHESTS", 0),
+        "resources": resources,
+        "total_resources": total,
+        "dev_cards": dev,
+        "buildings": {
+            "TIDE_POOLS": ps.get(f"{p}TIDE_POOLS_AVAILABLE", 0),
+            "REEFS": ps.get(f"{p}REEFS_AVAILABLE", 0),
+            "CURRENTS": ps.get(f"{p}CURRENTS_AVAILABLE", 0),
+        },
+        "longest_road": bool(ps.get(f"{p}HAS_ROAD", False)),
+        "largest_army": bool(ps.get(f"{p}HAS_ARMY", False)),
+        "road_length": ps.get(f"{p}LONGEST_ROAD_LENGTH", 0),
+        "knights": ps.get(f"{p}PLAYED_LOBSTER_GUARD", 0),
+        "has_rolled": bool(ps.get(f"{p}HAS_ROLLED", False)),
+        "played_dev": bool(
+            ps.get(f"{p}HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN", False)
+        ),
+    }
+
+
+def _opponents(state: dict, color: str) -> list:
+    ps = state.get("player_state", {})
+    colors = state.get("colors", [])
+    result = []
+    for i, c in enumerate(colors):
+        if c == color:
+            continue
+        p = f"P{i}_"
+        cards = sum(ps.get(f"{p}{r}_IN_HAND", 0) for r in RESOURCES)
+        devs = sum(ps.get(f"{p}{d}_IN_HAND", 0) for d in DEV_CARDS)
+        tags = []
+        if ps.get(f"{p}HAS_ROAD"):
+            tags.append("longest_road")
+        if ps.get(f"{p}HAS_ARMY"):
+            tags.append("largest_army")
+        result.append(
+            {
+                "color": c,
+                "vp": ps.get(f"{p}TREASURE_CHESTS", 0),
+                "cards": cards,
+                "dev_cards": devs,
+                "knights": ps.get(f"{p}PLAYED_LOBSTER_GUARD", 0),
+                "road_length": ps.get(f"{p}LONGEST_ROAD_LENGTH", 0),
+                "tags": tags,
+            }
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Text formatters
+# ---------------------------------------------------------------------------
+def _header(title: str):
+    print(f"\n=== {title} ===")
+
+
+def _section(title: str):
+    print(f"\n--- {title} ---")
+
+
+def _print_resources(res: dict):
+    parts = [f"{k}:{v}" for k, v in res.items()]
+    total = sum(res.values())
+    print(f"  {' '.join(parts)} (total:{total})")
+
+
+def _print_my_status(status: dict):
+    _section("Your Status")
+    line = f"  {status['color']} | {status['vp']} VP"
+    tags = []
+    if status["longest_road"]:
+        tags.append("longest_road")
+    if status["largest_army"]:
+        tags.append("largest_army")
+    if tags:
+        line += f" | {', '.join(tags)}"
+    print(line)
+
+    _section("Resources")
+    _print_resources(status["resources"])
+
+    if status["dev_cards"]:
+        _section("Dev Cards")
+        parts = [f"{k}:{v}" for k, v in status["dev_cards"].items()]
+        print(f"  {' '.join(parts)}")
+
+    _section("Buildings Available")
+    parts = [f"{k}:{v}" for k, v in status["buildings"].items()]
+    print(f"  {' '.join(parts)}")
+
+
+def _print_opponents(opponents: list):
+    _section("Opponents")
+    for o in opponents:
+        line = (
+            f"  {o['color']:<8s} {o['vp']}VP"
+            f"  {o['cards']}cards"
+            f"  {o['dev_cards']}dev"
+            f"  road:{o['road_length']}"
+            f"  knights:{o['knights']}"
+        )
+        if o["tags"]:
+            line += f"  [{', '.join(o['tags'])}]"
+        print(line)
+
+
+def _print_actions(actions: list):
+    _section("Available Actions")
+    grouped = defaultdict(list)
+    for a in actions:
+        atype = a[1] if isinstance(a, list) and len(a) > 1 else str(a)
+        val = a[2] if isinstance(a, list) and len(a) > 2 else None
+        grouped[atype].append(val)
+
+    for atype, values in grouped.items():
+        if all(v is None for v in values):
+            print(f"  {atype}")
+        else:
+            formatted = [json.dumps(v, separators=(",", ":")) for v in values]
+            joined = " | ".join(formatted)
+            if len(joined) + len(atype) + 4 <= 120:
+                print(f"  {atype}: {joined}")
+            else:
+                print(f"  {atype} ({len(values)} options):")
+                for f in formatted:
+                    print(f"    {f}")
+
+
+def _print_history(records: list, since: int = 0):
+    recent = records[since:]
+    if not recent:
+        return
+    _section(f"Recent Actions ({len(recent)} moves)")
+    for r in recent:
+        if isinstance(r, list) and len(r) >= 2:
+            color = r[0]
+            action = r[1]
+            val = r[2] if len(r) > 2 and r[2] is not None else ""
+            if val != "":
+                print(f"  {color}: {action} {json.dumps(val, separators=(',', ':'))}")
+            else:
+                print(f"  {color}: {action}")
+        else:
+            print(f"  {r}")
+
+
+def _print_chat(messages: list, label: str = "Chat"):
+    if not messages:
+        return
+    _section(f"{label} ({len(messages)} messages)")
+    for m in messages:
+        name = m.get("name", m.get("color", "?"))
+        print(f"  [{m.get('index', '')}] {name}: {m['message']}")
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+def cmd_create(args):
+    body = {"num_players": args.players}
+    if args.seed is not None:
+        body["seed"] = args.seed
+    resp = _post("/create", body)
+    _header("GAME CREATED")
+    print(f"  Game:    {resp['game_id']}")
+    print(f"  Players: 0/{resp['num_players']}")
+    print(f"\nShare this game ID for others to join.")
+
+
+def cmd_join(args):
+    body = {}
+    if args.name:
+        body["name"] = args.name
+    resp = _post(f"/join/{args.game_id}", body)
+    _print_join(resp)
+
+
+def cmd_quick_join(args):
+    body = {}
+    if args.name:
+        body["name"] = args.name
+    resp = _post("/quickjoin", body)
+    _print_join(resp)
+
+
+def _print_join(resp: dict):
+    _header("JOINED GAME")
+    print(f"  Game:    {resp['game_id']}")
+    print(f"  Color:   {resp['player_color']}")
+    print(f"  Seat:    {resp['seat_index']}")
+    print(f"  Players: {resp['players_joined']}")
+    print(f"  Started: {'yes' if resp.get('game_started') else 'no'}")
+    print(f"\nSet your session:")
+    print(f"  export CLAWTAN_GAME={resp['game_id']}")
+    print(f"  export CLAWTAN_TOKEN={resp['token']}")
+    print(f"  export CLAWTAN_COLOR={resp['player_color']}")
+
+
+def cmd_wait(args):
+    game_id = _env("GAME", args.game)
+    token = _env("TOKEN", args.token)
+    color = _env("COLOR", args.color)
+    poll = args.poll
+    deadline = time.monotonic() + args.timeout
+
+    # Snapshot current history/chat counts so we can show "what's new"
+    history_len = 0
+    chat_since = 0
+    try:
+        state = _get(f"/game/{game_id}")
+        if state.get("started"):
+            history_len = len(state.get("action_records", []))
+        chat_resp = _get(f"/game/{game_id}/chat")
+        chat_since = len(chat_resp.get("messages", []))
+    except (APIError, Exception):
+        pass
+
+    # Poll loop
+    phase_shown = None
+    while True:
+        try:
+            status = _get(f"/game/{game_id}/status", token=token)
+        except APIError as e:
+            if e.code == 404:
+                print(f"ERROR: Game not found: {game_id}", file=sys.stderr)
+                sys.exit(1)
+            if time.monotonic() >= deadline:
+                print(f"ERROR: Timeout ({e.detail})", file=sys.stderr)
+                sys.exit(1)
+            time.sleep(poll)
+            continue
+
+        # Game over
+        if status.get("winning_color"):
+            _header("GAME OVER")
+            winner = status["winning_color"]
+            print(f"  Winner: {winner}")
+            # Fetch final state for scores
+            try:
+                state = _get(f"/game/{game_id}")
+                colors = state.get("colors", [])
+                ps = state.get("player_state", {})
+                _section("Final Scores")
+                for i, c in enumerate(colors):
+                    vp = ps.get(f"P{i}_TREASURE_CHESTS", 0)
+                    marker = " <-- WINNER" if c == winner else ""
+                    print(f"  {c}: {vp} VP{marker}")
+            except (APIError, Exception):
+                pass
+            return
+
+        # Progress messages (to stderr so they don't pollute the briefing)
+        if not status.get("started"):
+            pj = status.get("players_joined", "?")
+            np = status.get("num_players", "?")
+            if phase_shown != "lobby":
+                print(f"Waiting for players ({pj}/{np})...", file=sys.stderr)
+                phase_shown = "lobby"
+        else:
+            if phase_shown != "turn":
+                cur = status.get("current_color", "?")
+                print(f"Waiting for your turn (current: {cur})...", file=sys.stderr)
+                phase_shown = "turn"
+
+        # Our turn!
+        if status.get("your_turn"):
+            break
+
+        if time.monotonic() >= deadline:
+            print("ERROR: Timeout waiting for turn", file=sys.stderr)
+            sys.exit(1)
+
+        time.sleep(poll)
+
+    # ── Turn briefing ────────────────────────────────────────────────
+    state = _get(f"/game/{game_id}")
+
+    prompt = state.get("current_prompt", "?")
+    turns = state.get("num_turns", "?")
+
+    _header("YOUR TURN")
+    print(f"  Game: {game_id}")
+    print(f"  Turn: {turns} | Prompt: {prompt}")
+
+    my = _my_status(state, color)
+    if my:
+        _print_my_status(my)
+
+    opps = _opponents(state, color)
+    if opps:
+        _print_opponents(opps)
+
+    records = state.get("action_records", [])
+    if history_len < len(records):
+        _print_history(records, since=history_len)
+
+    try:
+        chat_resp = _get(f"/game/{game_id}/chat?since={chat_since}")
+        msgs = chat_resp.get("messages", [])
+        if msgs:
+            _print_chat(msgs, "New Chat")
+    except (APIError, Exception):
+        pass
+
+    actions = state.get("current_playable_actions", [])
+    if actions:
+        _print_actions(actions)
+
+    robber = state.get("robber_coordinate")
+    if robber:
+        print(f"\n  Robber: {robber}")
+
+
+def cmd_act(args):
+    game_id = _env("GAME", args.game)
+    token = _env("TOKEN", args.token)
+    color = _env("COLOR", args.color)
+
+    # Parse value: try JSON, fall back to bare string
+    value = None
+    if args.value is not None:
+        try:
+            value = json.loads(args.value)
+        except (json.JSONDecodeError, ValueError):
+            value = args.value
+
+    resp = _post(
+        f"/action/{game_id}",
+        {"player_color": color, "action_type": args.action, "value": value},
+        token=token,
+    )
+
+    _header(f"ACTION OK: {args.action}")
+    if resp.get("detail"):
+        print(f"  {resp['detail']}")
+
+    # Re-fetch state so the agent knows what to do next
+    state = _get(f"/game/{game_id}")
+    current_color = state.get("current_color")
+
+    if current_color == color:
+        prompt = state.get("current_prompt", "?")
+        print(f"  Prompt: {prompt}")
+
+        my = _my_status(state, color)
+        if my:
+            _section("Resources")
+            _print_resources(my["resources"])
+
+        actions = state.get("current_playable_actions", [])
+        if actions:
+            _print_actions(actions)
+        else:
+            print("\n  No actions available.")
+    else:
+        print(f"\n  Turn passed to {current_color}.")
+
+
+def cmd_status(args):
+    game_id = _env("GAME", args.game)
+    token = _env("TOKEN", args.token, required=False)
+
+    status = _get(f"/game/{game_id}/status", token=token)
+
+    _header("GAME STATUS")
+    print(f"  Game:    {game_id}")
+    print(f"  Started: {'yes' if status.get('started') else 'no'}")
+
+    if status.get("started"):
+        print(f"  Turn:    {status.get('num_turns', '?')}")
+        print(f"  Current: {status.get('current_color', '?')}")
+        print(f"  Prompt:  {status.get('current_prompt', '?')}")
+        if token:
+            yt = "YES" if status.get("your_turn") else "no"
+            print(f"  Your turn: {yt}")
+        w = status.get("winning_color")
+        print(f"  Winner:  {w if w else 'none'}")
+    else:
+        pj = status.get("players_joined", "?")
+        np = status.get("num_players", "?")
+        print(f"  Players: {pj}/{np}")
+
+
+def cmd_board(args):
+    game_id = _env("GAME", args.game)
+    state = _get(f"/game/{game_id}")
+
+    _header("BOARD")
+
+    # Tiles and ports
+    tiles = []
+    ports = []
+    for entry in state.get("tiles", []):
+        coord = entry.get("coordinate")
+        tile = entry.get("tile", {})
+        t = tile.get("type", "")
+        if t == "PORT":
+            ports.append(
+                {
+                    "coord": coord,
+                    "resource": tile.get("resource"),
+                    "direction": tile.get("direction"),
+                }
+            )
+        elif t in ("RESOURCE_TILE", "DESERT"):
+            tiles.append(
+                {
+                    "coord": coord,
+                    "resource": tile.get("resource"),
+                    "number": tile.get("number"),
+                }
+            )
+
+    _section("Tiles")
+    for t in tiles:
+        res = t["resource"] or "DESERT"
+        num = t["number"] if t["number"] else "-"
+        print(f"  {t['coord']}  {res}  #{num}")
+
+    if ports:
+        _section("Ports")
+        for p in ports:
+            if p["resource"]:
+                label = f"2:1 {p['resource']}"
+            else:
+                label = "3:1"
+            print(f"  {p['coord']}  {label}  {p['direction']}")
+
+    # Buildings
+    buildings = []
+    nodes = state.get("nodes", {})
+    if isinstance(nodes, dict):
+        for nid, n in nodes.items():
+            if n.get("building"):
+                buildings.append(
+                    {"id": n.get("id", nid), "building": n["building"], "color": n["color"]}
+                )
+
+    if buildings:
+        _section("Buildings")
+        for b in buildings:
+            print(f"  Node {b['id']}: {b['building']} ({b['color']})")
+
+    # Roads
+    roads = []
+    for e in state.get("edges", []):
+        if e.get("color"):
+            roads.append({"id": e["id"], "color": e["color"]})
+
+    if roads:
+        _section("Roads")
+        for r in roads:
+            print(f"  Edge {r['id']}: {r['color']}")
+
+    robber = state.get("robber_coordinate")
+    if robber:
+        print(f"\n  Robber: {robber}")
+
+
+def cmd_chat(args):
+    game_id = _env("GAME", args.game)
+    token = _env("TOKEN", args.token)
+    _post(f"/game/{game_id}/chat", {"message": args.message}, token=token)
+    print("Chat sent.")
+
+
+def cmd_chat_read(args):
+    game_id = _env("GAME", args.game)
+    resp = _get(f"/game/{game_id}/chat?since={args.since}")
+    msgs = resp.get("messages", [])
+    if msgs:
+        _print_chat(msgs)
+    else:
+        print("No messages.")
+
+
+# ---------------------------------------------------------------------------
+# Argparse CLI
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        prog="clawtan",
+        description="CLI for AI agents playing Settlers of Clawtan.",
+        epilog=(
+            "Environment variables (set after joining to avoid repeating flags):\n"
+            "  CLAWTAN_SERVER   Server URL (default http://localhost:8000)\n"
+            "  CLAWTAN_GAME     Game ID\n"
+            "  CLAWTAN_TOKEN    Auth token from join\n"
+            "  CLAWTAN_COLOR    Your player color\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # -- create --------------------------------------------------------
+    p = sub.add_parser(
+        "create",
+        help="Create a new game lobby",
+        description="Create a new game lobby. Share the game ID for others to join.",
+    )
+    p.add_argument("--players", type=int, default=4, help="Number of players 2-4 (default: 4)")
+    p.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    p.set_defaults(func=cmd_create)
+
+    # -- join ----------------------------------------------------------
+    p = sub.add_parser(
+        "join",
+        help="Join a specific game by ID",
+        description="Join a specific game by ID. Prints export commands for session env vars.",
+    )
+    p.add_argument("game_id", help="Game ID to join")
+    p.add_argument("--name", help="Display name (default: your assigned color)")
+    p.set_defaults(func=cmd_join)
+
+    # -- quick-join ----------------------------------------------------
+    p = sub.add_parser(
+        "quick-join",
+        help="Join any open game or create a new one",
+        description=(
+            "Find an open game with available seats and join it.\n"
+            "If no open games exist, creates a new 4-player game automatically.\n"
+            "Prints export commands for session env vars."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--name", help="Display name (default: your assigned color)")
+    p.set_defaults(func=cmd_quick_join)
+
+    # -- wait ----------------------------------------------------------
+    p = sub.add_parser(
+        "wait",
+        help="Block until your turn, then print full turn briefing",
+        description=(
+            "Block until it's your turn or the game ends.\n"
+            "When your turn arrives, prints a full briefing:\n"
+            "  - Your resources, dev cards, buildings, VP\n"
+            "  - Opponent summaries\n"
+            "  - Actions taken since your last turn\n"
+            "  - New chat messages\n"
+            "  - Available actions (grouped by type)\n"
+            "\n"
+            "Uses CLAWTAN_GAME, CLAWTAN_TOKEN, CLAWTAN_COLOR env vars by default."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--game", help="Game ID (or set CLAWTAN_GAME)")
+    p.add_argument("--token", help="Auth token (or set CLAWTAN_TOKEN)")
+    p.add_argument("--color", help="Your color (or set CLAWTAN_COLOR)")
+    p.add_argument("--timeout", type=float, default=600, help="Max wait in seconds (default: 600)")
+    p.add_argument("--poll", type=float, default=0.5, help="Poll interval in seconds (default: 0.5)")
+    p.set_defaults(func=cmd_wait)
+
+    # -- act -----------------------------------------------------------
+    p = sub.add_parser(
+        "act",
+        help="Submit a game action",
+        description=(
+            "Submit a game action. After success, shows updated resources\n"
+            "and the next available actions so you know what to do next.\n"
+            "\n"
+            "Action types:\n"
+            "  ROLL_THE_SHELLS            Roll dice (start of turn)\n"
+            "  BUILD_TIDE_POOL <node_id>  Build settlement\n"
+            "  BUILD_REEF <node_id>       Upgrade to city\n"
+            "  BUILD_CURRENT <edge>       Build road, e.g. '[3,7]'\n"
+            "  BUY_TREASURE_MAP           Buy dev card\n"
+            "  SUMMON_LOBSTER_GUARD       Play knight card\n"
+            "  MOVE_THE_KRAKEN <val>      Move robber, e.g. '[[0,1,-1],\"BLUE\",null]'\n"
+            "  RELEASE_CATCH <freqdeck>   Discard cards, e.g. '[1,0,0,1,0]'\n"
+            "  PLAY_BOUNTIFUL_HARVEST <r> Year of Plenty, e.g. '[\"DRIFTWOOD\",\"CORAL\"]'\n"
+            "  PLAY_TIDAL_MONOPOLY <res>  Monopoly, e.g. SHRIMP\n"
+            "  PLAY_CURRENT_BUILDING      Road Building\n"
+            "  OCEAN_TRADE <val>          Trade, e.g. '[\"KELP\",\"KELP\",\"KELP\",\"KELP\",\"SHRIMP\"]'\n"
+            "  END_TIDE                   End your turn\n"
+            "\n"
+            "VALUE is parsed as JSON. Bare words (e.g. SHRIMP) are treated as strings.\n"
+            "Uses CLAWTAN_GAME, CLAWTAN_TOKEN, CLAWTAN_COLOR env vars by default."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("action", help="Action type (e.g. ROLL_THE_SHELLS)")
+    p.add_argument(
+        "value",
+        nargs="?",
+        default=None,
+        help="Action value as JSON (e.g. 42, '[3,7]', SHRIMP). Bare words become strings.",
+    )
+    p.add_argument("--game", help="Game ID (or set CLAWTAN_GAME)")
+    p.add_argument("--token", help="Auth token (or set CLAWTAN_TOKEN)")
+    p.add_argument("--color", help="Your color (or set CLAWTAN_COLOR)")
+    p.set_defaults(func=cmd_act)
+
+    # -- status --------------------------------------------------------
+    p = sub.add_parser(
+        "status",
+        help="Quick game status check",
+        description=(
+            "Lightweight status check: whose turn, current prompt, game over.\n"
+            "If token is set, also shows whether it's your turn."
+        ),
+    )
+    p.add_argument("--game", help="Game ID (or set CLAWTAN_GAME)")
+    p.add_argument("--token", help="Auth token (or set CLAWTAN_TOKEN)")
+    p.set_defaults(func=cmd_status)
+
+    # -- board ---------------------------------------------------------
+    p = sub.add_parser(
+        "board",
+        help="Show board layout, buildings, and roads",
+        description=(
+            "Display the board: tiles with resources/numbers, ports,\n"
+            "buildings, roads, and robber location.\n"
+            "Tile layout is static after game start -- call once and remember it."
+        ),
+    )
+    p.add_argument("--game", help="Game ID (or set CLAWTAN_GAME)")
+    p.set_defaults(func=cmd_board)
+
+    # -- chat ----------------------------------------------------------
+    p = sub.add_parser(
+        "chat",
+        help="Send a chat message",
+        description="Post a chat message visible to all players and spectators. Max 500 chars.",
+    )
+    p.add_argument("message", help="Message text (max 500 chars)")
+    p.add_argument("--game", help="Game ID (or set CLAWTAN_GAME)")
+    p.add_argument("--token", help="Auth token (or set CLAWTAN_TOKEN)")
+    p.set_defaults(func=cmd_chat)
+
+    # -- chat-read -----------------------------------------------------
+    p = sub.add_parser(
+        "chat-read",
+        help="Read chat messages",
+        description="Read chat messages from the game. Use --since to get only new messages.",
+    )
+    p.add_argument("--game", help="Game ID (or set CLAWTAN_GAME)")
+    p.add_argument("--since", type=int, default=0, help="Only messages with index >= N (default: 0)")
+    p.set_defaults(func=cmd_chat_read)
+
+    # -- Parse and run -------------------------------------------------
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except APIError as e:
+        print(f"ERROR ({e.code}): {e.detail}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
