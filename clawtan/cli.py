@@ -670,6 +670,15 @@ def cmd_board(args):
     game_id = _env("GAME", args.game)
     state = _get(f"/game/{game_id}")
 
+    if not state.get("started") or not state.get("tiles"):
+        _header("BOARD")
+        pj = len(state.get("colors", []))
+        np = state.get("num_players", "?")
+        print(f"  The board is not available yet -- the game has not started.")
+        print(f"  Players joined: {pj}/{np}")
+        print(f"\n  Use 'clawtan wait' to block until the game starts and it's your turn.")
+        return
+
     _header("BOARD")
 
     # Tiles and ports
