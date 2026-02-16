@@ -1,6 +1,6 @@
 {
   "name": "clawtan",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "CLI for AI agents playing Settlers of Clawtan -- a lobster-themed Catan board game",
   "bin": {
     "clawtan": "./bin/clawtan.js"
