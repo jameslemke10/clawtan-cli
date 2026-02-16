@@ -279,8 +279,10 @@ def _print_opponents(opponents: list):
 
 _ACTION_HINTS = {
     "RELEASE_CATCH": (
-        "Discard cards (freqdeck=[DRIFTWOOD,CORAL,SHRIMP,KELP,PEARL]).\n"
-        "    CLI: clawtan act RELEASE_CATCH '<freqdeck>'  e.g. clawtan act RELEASE_CATCH '[1,0,0,1,0]'"
+        "Discard cards. Run with no value to discard randomly:\n"
+        "    CLI: clawtan act RELEASE_CATCH\n"
+        "    Or pick specific cards (freqdeck=[DRIFTWOOD,CORAL,SHRIMP,KELP,PEARL]):\n"
+        "    CLI: clawtan act RELEASE_CATCH '[1,0,0,1,0]'"
     ),
     "MOVE_THE_KRAKEN": (
         "Move robber: value = [coordinate, victim_color_or_null, null].\n"
@@ -787,7 +789,7 @@ def main():
             "  BUY_TREASURE_MAP           Buy dev card\n"
             "  SUMMON_LOBSTER_GUARD       Play knight card\n"
             "  MOVE_THE_KRAKEN <val>      Move robber, e.g. '[[0,1,-1],\"BLUE\",null]'\n"
-            "  RELEASE_CATCH <freqdeck>   Discard cards, e.g. '[1,0,0,1,0]'\n"
+            "  RELEASE_CATCH [freqdeck]   Discard cards (no value = random), e.g. '[1,0,0,1,0]'\n"
             "  PLAY_BOUNTIFUL_HARVEST <r> Year of Plenty, e.g. '[\"DRIFTWOOD\",\"CORAL\"]'\n"
             "  PLAY_TIDAL_MONOPOLY <res>  Monopoly, e.g. SHRIMP\n"
             "  PLAY_CURRENT_BUILDING      Road Building\n"
