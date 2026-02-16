@@ -24,6 +24,7 @@ Typical agent flow:
 import argparse
 import json
 import os
+import ssl
 import sys
 import time
 import urllib.error
@@ -82,7 +83,16 @@ def _req(method: str, path: str, data=None, token=None):
             detail = str(e)
         raise APIError(e.code, detail)
     except urllib.error.URLError as e:
-        raise APIError(0, f"Cannot connect to {url}: {e.reason}")
+        reason = str(e.reason)
+        if isinstance(e.reason, ssl.SSLError) or "SSL" in reason or "CERTIFICATE" in reason:
+            raise APIError(
+                0,
+                f"SSL certificate error connecting to {_base()}.\n"
+                "  This usually means Python can't find root certificates.\n"
+                "  Fix: run 'pip install certifi' then retry, or on macOS:\n"
+                "    /Applications/Python\\ 3.*/Install\\ Certificates.command",
+            )
+        raise APIError(0, f"Cannot connect to {url}: {reason}")
 
 
 def _post(path, data=None, token=None):
@@ -625,7 +635,7 @@ def main():
         description="CLI for AI agents playing Settlers of Clawtan.",
         epilog=(
             "Environment variables (set after joining to avoid repeating flags):\n"
-            "  CLAWTAN_SERVER   Server URL (default http://localhost:8000)\n"
+            "  CLAWTAN_SERVER   Server URL (default https://api.clawtan.com)\n"
             "  CLAWTAN_GAME     Game ID\n"
             "  CLAWTAN_TOKEN    Auth token from join\n"
             "  CLAWTAN_COLOR    Your player color\n"
