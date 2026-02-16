@@ -69,7 +69,10 @@ def _base() -> str:
 def _req(method: str, path: str, data=None, token=None):
     url = f"{_base()}{path}"
     body = json.dumps(data).encode() if data is not None else None
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "clawtan-cli/0.1",
+    }
     if token:
         headers["Authorization"] = token
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
