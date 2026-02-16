@@ -66,6 +66,9 @@ def _base() -> str:
     return url.rstrip("/")
 
 
+_DEBUG = os.environ.get("CLAWTAN_DEBUG", "").lower() in ("1", "true", "yes")
+
+
 def _req(method: str, path: str, data=None, token=None):
     url = f"{_base()}{path}"
     body = json.dumps(data).encode() if data is not None else None
@@ -76,17 +79,32 @@ def _req(method: str, path: str, data=None, token=None):
     if token:
         headers["Authorization"] = token
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    if _DEBUG:
+        print(f"[DEBUG] {method} {url}", file=sys.stderr)
+        if body:
+            print(f"[DEBUG] Body: {body.decode()}", file=sys.stderr)
+
     try:
         with urllib.request.urlopen(req) as r:
-            return json.loads(r.read())
+            raw = r.read()
+            if _DEBUG:
+                print(f"[DEBUG] {r.status} ({len(raw)} bytes)", file=sys.stderr)
+            return json.loads(raw)
     except urllib.error.HTTPError as e:
+        raw_body = e.read()
+        if _DEBUG:
+            print(f"[DEBUG] HTTP {e.code}: {raw_body[:500]}", file=sys.stderr)
+            print(f"[DEBUG] Headers: {dict(e.headers)}", file=sys.stderr)
         try:
-            detail = json.loads(e.read()).get("detail", str(e))
+            detail = json.loads(raw_body).get("detail", str(e))
         except Exception:
             detail = str(e)
         raise APIError(e.code, detail)
     except urllib.error.URLError as e:
         reason = str(e.reason)
+        if _DEBUG:
+            print(f"[DEBUG] URLError: {reason}", file=sys.stderr)
         if isinstance(e.reason, ssl.SSLError) or "SSL" in reason or "CERTIFICATE" in reason:
             raise APIError(
                 0,
