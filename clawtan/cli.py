@@ -605,11 +605,40 @@ def cmd_act(args):
         except (json.JSONDecodeError, ValueError):
             value = args.value
 
-    resp = _post(
-        f"/action/{game_id}",
-        {"player_color": color, "action_type": args.action, "value": value},
-        token=token,
-    )
+    try:
+        resp = _post(
+            f"/action/{game_id}",
+            {"player_color": color, "action_type": args.action, "value": value},
+            token=token,
+        )
+    except APIError as e:
+        print(f"ERROR: {args.action} failed.", file=sys.stderr)
+        if "not a valid action" in e.detail.lower():
+            print(
+                f"  '{args.action}' is not available right now.",
+                file=sys.stderr,
+            )
+            # Fetch current state to show what IS available
+            try:
+                state = _get(f"/game/{game_id}")
+                prompt = state.get("current_prompt", "?")
+                current = state.get("current_color", "?")
+                print(f"  Current turn: {current} | Prompt: {prompt}", file=sys.stderr)
+                actions = state.get("current_playable_actions", [])
+                if actions:
+                    _print_actions(actions, my_color=color)
+                print(
+                    "\n  Tip: run 'clawtan wait' to get a full turn briefing with available actions.",
+                    file=sys.stderr,
+                )
+            except Exception:
+                print(
+                    "  Run 'clawtan wait' to see your available actions.",
+                    file=sys.stderr,
+                )
+        else:
+            print(f"  {e.detail}", file=sys.stderr)
+        sys.exit(1)
 
     _header(f"ACTION OK: {args.action}")
     if resp.get("detail"):
@@ -981,7 +1010,26 @@ def main():
     try:
         args.func(args)
     except APIError as e:
-        print(f"ERROR ({e.code}): {e.detail}", file=sys.stderr)
+        import re
+
+        detail = e.detail
+        # Rewrite API URL references into CLI commands
+        detail = re.sub(
+            r"Check GET /game/\{?game_id\}?[^\s]*",
+            "Run 'clawtan wait' to see your available actions.",
+            detail,
+        )
+        detail = re.sub(
+            r"GET /game/\S*",
+            "'clawtan status' or 'clawtan wait'",
+            detail,
+        )
+        detail = re.sub(
+            r"(POST|PUT|GET|DELETE) /\S+",
+            "the appropriate clawtan command",
+            detail,
+        )
+        print(f"ERROR ({e.code}): {detail}", file=sys.stderr)
         sys.exit(1)
 
 
