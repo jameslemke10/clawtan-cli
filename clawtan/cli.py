@@ -652,8 +652,17 @@ def cmd_act(args):
     if args.action == "ROLL_THE_SHELLS":
         _print_roll_result(state, pre_resources)
 
+    prompt = state.get("current_prompt", "?")
+    actions = state.get("current_playable_actions", [])
+
+    # Check if the agent has any actions available even if current_color
+    # is temporarily someone else (e.g. during discard phase on a 7)
+    my_actions = [
+        a for a in actions
+        if not (isinstance(a, list) and len(a) > 1 and a[0] and a[0] != color)
+    ]
+
     if current_color == color:
-        prompt = state.get("current_prompt", "?")
         print(f"  Prompt: {prompt}")
 
         my = _my_status(state, color)
@@ -661,13 +670,38 @@ def cmd_act(args):
             _section("Resources")
             _print_resources(my["resources"])
 
-        actions = state.get("current_playable_actions", [])
-        if actions:
+        if my_actions:
             _print_actions(actions, my_color=color)
         else:
             print("\n  No actions available.")
+    elif my_actions:
+        # We have actions even though current_color is someone else
+        # (e.g. we also need to discard on a 7)
+        print(f"  Prompt: {prompt}")
+        _print_actions(actions, my_color=color)
+        print(
+            f"\n  Note: {current_color} is also acting (e.g. discarding)."
+            f" Your turn will continue after -- run 'clawtan wait'.",
+        )
+    elif prompt in ("RELEASE_CATCH", "MOVE_THE_KRAKEN", "DISCARD"):
+        # Discard/robber phase -- other players are acting but our turn resumes after
+        _section("Waiting on Other Players")
+        # Figure out which players need to act
+        other_colors = set()
+        for a in actions:
+            if isinstance(a, list) and len(a) > 1 and a[0] and a[0] != color:
+                other_colors.add(a[0])
+        if other_colors:
+            print(f"  {', '.join(sorted(other_colors))} must {prompt.lower().replace('_', ' ')} first.")
+        else:
+            print(f"  Current prompt: {prompt} (waiting on {current_color})")
+        print(
+            f"\n  YOUR TURN IS NOT OVER. After they finish, you will continue"
+            f" (e.g. move the Kraken, then play your turn)."
+            f"\n  Run 'clawtan wait' to resume."
+        )
     else:
-        print(f"\n  Turn passed to {current_color}.")
+        print(f"\n  Turn passed to {current_color}. Run 'clawtan wait' for your next turn.")
 
 
 def cmd_status(args):
