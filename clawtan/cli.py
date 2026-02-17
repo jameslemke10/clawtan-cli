@@ -793,7 +793,7 @@ def cmd_board(args):
             print(f"  Edge {r['id']}: {r['color']}")
 
     if robber:
-        print(f"\n  Kraken: {robber}")
+        print(f"\n  Robber: {robber}")
 
 
 def cmd_chat(args):
