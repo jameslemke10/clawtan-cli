@@ -3,22 +3,21 @@
 clawtan -- CLI for AI agents playing Settlers of Clawtan.
 
 Every command prints structured text to stdout designed for easy scanning
-by LLM agents. Set environment variables for session persistence:
-
-    CLAWTAN_SERVER  Server URL (default: http://localhost:8000)
-    CLAWTAN_GAME    Game ID
-    CLAWTAN_TOKEN   Auth token from join
-    CLAWTAN_COLOR   Your player color
+by LLM agents. Session credentials are saved automatically on join.
 
 Typical agent flow:
-    clawtan quick-join --name "LobsterBot"
-    export CLAWTAN_GAME=...  CLAWTAN_TOKEN=...  CLAWTAN_COLOR=...
+    clawtan quick-join --name "LobsterBot"   # session saved to ~/.clawtan_session
     clawtan board            # once, to learn the map
     clawtan wait             # blocks until your turn
     clawtan act ROLL_THE_SHELLS
     clawtan act BUILD_TIDE_POOL 42
     clawtan act END_TIDE
     clawtan wait             # next turn...
+
+Session lookup order (per field):
+    1. CLI flags (--game, --token, --color)
+    2. Environment variables (CLAWTAN_GAME, CLAWTAN_TOKEN, CLAWTAN_COLOR)
+    3. Session file (~/.clawtan_session, override with CLAWTAN_SESSION_FILE)
 """
 
 import argparse
@@ -125,13 +124,47 @@ def _get(path, token=None):
 
 
 # ---------------------------------------------------------------------------
-# Environment variable helpers
+# Session file helpers
+# ---------------------------------------------------------------------------
+def _session_path() -> str:
+    return os.environ.get("CLAWTAN_SESSION_FILE") or os.path.expanduser("~/.clawtan_session")
+
+
+def _save_session(game_id: str, token: str, color: str):
+    path = _session_path()
+    data = {"GAME": game_id, "TOKEN": token, "COLOR": color}
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except OSError as e:
+        print(f"Warning: could not save session to {path}: {e}", file=sys.stderr)
+
+
+def _load_session() -> dict:
+    path = _session_path()
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Environment / session variable helpers
 # ---------------------------------------------------------------------------
 def _env(name: str, arg_val=None, required=True):
-    val = arg_val or os.environ.get(f"CLAWTAN_{name}")
+    # 1. CLI flag
+    val = arg_val
+    # 2. Environment variable
+    if not val:
+        val = os.environ.get(f"CLAWTAN_{name}")
+    # 3. Session file
+    if not val:
+        val = _load_session().get(name)
     if required and not val:
         print(
-            f"ERROR: Missing {name}. Pass --{name.lower()} or set CLAWTAN_{name}",
+            f"ERROR: Missing {name}. Pass --{name.lower()}, set CLAWTAN_{name},"
+            f" or run 'clawtan quick-join' to create a session.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -290,10 +323,8 @@ def _print_opponents(opponents: list):
 
 _ACTION_HINTS = {
     "RELEASE_CATCH": (
-        "Discard cards. Run with no value to discard randomly:\n"
-        "    CLI: clawtan act RELEASE_CATCH\n"
-        "    Or pick specific cards (freqdeck=[DRIFTWOOD,CORAL,SHRIMP,KELP,PEARL]):\n"
-        "    CLI: clawtan act RELEASE_CATCH '[1,0,0,1,0]'"
+        "Discard half your cards (server selects randomly).\n"
+        "    CLI: clawtan act RELEASE_CATCH"
     ),
     "MOVE_THE_KRAKEN": (
         "Move robber: value = [coordinate, victim_color_or_null, null].\n"
@@ -360,22 +391,58 @@ def _print_actions(actions: list, my_color: str | None = None):
         print(f"\n  (other players still need to act: {', '.join(sorted(other_colors))})")
 
 
+def _unpack_record(r):
+    """Unpack an action record into (color, action_type, value).
+
+    Records may be nested [[color, type, value], result] or flat [color, type, value].
+    """
+    if isinstance(r, list) and len(r) >= 2 and isinstance(r[0], list):
+        action = r[0]
+        color = action[0] if len(action) > 0 else None
+        atype = action[1] if len(action) > 1 else None
+        val = action[2] if len(action) > 2 else None
+        return color, atype, val
+    if isinstance(r, list) and len(r) >= 2:
+        color = r[0]
+        atype = r[1]
+        val = r[2] if len(r) > 2 else None
+        return color, atype, val
+    return None, None, None
+
+
 def _print_history(records: list, since: int = 0):
     recent = records[since:]
     if not recent:
         return
     _section(f"Recent Actions ({len(recent)} moves)")
     for r in recent:
-        if isinstance(r, list) and len(r) >= 2:
-            color = r[0]
-            action = r[1]
-            val = r[2] if len(r) > 2 and r[2] is not None else ""
-            if val != "":
+        color, action, val = _unpack_record(r)
+        if color and action:
+            if val is not None:
                 print(f"  {color}: {action} {json.dumps(val, separators=(',', ':'))}")
             else:
                 print(f"  {color}: {action}")
         else:
             print(f"  {r}")
+
+
+def _count_turns(state: dict) -> int:
+    """Count ROLL_THE_SHELLS records to get the turn number."""
+    count = 0
+    for r in state.get("action_records", []):
+        _, atype, _ = _unpack_record(r)
+        if atype == "ROLL_THE_SHELLS":
+            count += 1
+    return count
+
+
+def _who_rolled_last(state: dict) -> str | None:
+    """Return the color of the player who made the most recent roll."""
+    for r in reversed(state.get("action_records", [])):
+        color, atype, _ = _unpack_record(r)
+        if atype == "ROLL_THE_SHELLS":
+            return color
+    return None
 
 
 def _print_chat(messages: list, label: str = "Chat"):
@@ -424,10 +491,10 @@ def _print_join(resp: dict):
     print(f"  Seat:    {resp['seat_index']}")
     print(f"  Players: {resp['players_joined']}")
     print(f"  Started: {'yes' if resp.get('game_started') else 'no'}")
-    print(f"\nSet your session:")
-    print(f"  export CLAWTAN_GAME={resp['game_id']}")
-    print(f"  export CLAWTAN_TOKEN={resp['token']}")
-    print(f"  export CLAWTAN_COLOR={resp['player_color']}")
+
+    _save_session(resp["game_id"], resp["token"], resp["player_color"])
+    print(f"\n  Session saved to {_session_path()}")
+    print(f"  All subsequent clawtan commands will use this session automatically.")
 
 
 def cmd_wait(args):
@@ -510,7 +577,7 @@ def cmd_wait(args):
     state = _get(f"/game/{game_id}")
 
     prompt = state.get("current_prompt", "?")
-    turns = state.get("num_turns", "?")
+    turns = status.get("num_turns") or state.get("num_turns") or _count_turns(state)
 
     _header("YOUR TURN")
     print(f"  Game: {game_id}")
@@ -551,8 +618,9 @@ def _print_roll_result(state: dict, pre_resources: dict | None):
     records = state.get("action_records", [])
     roll_val = None
     for r in reversed(records):
-        if isinstance(r, list) and len(r) >= 2 and r[1] == "ROLL_THE_SHELLS":
-            roll_val = r[2] if len(r) > 2 else None
+        color, atype, val = _unpack_record(r)
+        if atype == "ROLL_THE_SHELLS":
+            roll_val = val
             break
 
     if roll_val is not None:
@@ -679,29 +747,8 @@ def cmd_act(args):
         # (e.g. we also need to discard on a 7)
         print(f"  Prompt: {prompt}")
         _print_actions(actions, my_color=color)
-        print(
-            f"\n  Note: {current_color} is also acting (e.g. discarding)."
-            f" Your turn will continue after -- run 'clawtan wait'.",
-        )
-    elif prompt in ("RELEASE_CATCH", "MOVE_THE_KRAKEN", "DISCARD"):
-        # Discard/robber phase -- other players are acting but our turn resumes after
-        _section("Waiting on Other Players")
-        # Figure out which players need to act
-        other_colors = set()
-        for a in actions:
-            if isinstance(a, list) and len(a) > 1 and a[0] and a[0] != color:
-                other_colors.add(a[0])
-        if other_colors:
-            print(f"  {', '.join(sorted(other_colors))} must {prompt.lower().replace('_', ' ')} first.")
-        else:
-            print(f"  Current prompt: {prompt} (waiting on {current_color})")
-        print(
-            f"\n  YOUR TURN IS NOT OVER. After they finish, you will continue"
-            f" (e.g. move the Kraken, then play your turn)."
-            f"\n  Run 'clawtan wait' to resume."
-        )
     else:
-        print(f"\n  Turn passed to {current_color}. Run 'clawtan wait' for your next turn.")
+        print(f"\n  Action done. No more actions available. Run 'clawtan wait' for your next turn or action required.")
 
 
 def cmd_status(args):
@@ -968,7 +1015,7 @@ def main():
             "  BUY_TREASURE_MAP           Buy dev card\n"
             "  SUMMON_LOBSTER_GUARD       Play knight card\n"
             "  MOVE_THE_KRAKEN <val>      Move robber, e.g. '[[0,1,-1],\"BLUE\",null]'\n"
-            "  RELEASE_CATCH [freqdeck]   Discard cards (no value = random), e.g. '[1,0,0,1,0]'\n"
+            "  RELEASE_CATCH              Discard half your cards (server selects randomly)\n"
             "  PLAY_BOUNTIFUL_HARVEST <r> Year of Plenty, e.g. '[\"DRIFTWOOD\",\"CORAL\"]'\n"
             "  PLAY_TIDAL_MONOPOLY <res>  Monopoly, e.g. SHRIMP\n"
             "  PLAY_CURRENT_BUILDING      Road Building\n"
