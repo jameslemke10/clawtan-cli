@@ -720,20 +720,66 @@ def cmd_board(args):
                 label = "3:1"
             print(f"  {p['coord']}  {label}  {p['direction']}")
 
-    # Buildings
-    buildings = []
-    nodes = state.get("nodes", {})
-    if isinstance(nodes, dict):
-        for nid, n in nodes.items():
-            if n.get("building"):
-                buildings.append(
-                    {"id": n.get("id", nid), "building": n["building"], "color": n["color"]}
-                )
+    # Build port lookup: node_id -> port label
+    port_nodes = state.get("port_nodes", {})
+    node_port = {}
+    for res_or_any, nids in port_nodes.items():
+        label = "3:1" if res_or_any == "ANY" else f"2:1 {res_or_any}"
+        for nid in nids:
+            node_port[str(nid)] = label
 
-    if buildings:
-        _section("Buildings")
-        for b in buildings:
-            print(f"  Node {b['id']}: {b['building']} ({b['color']})")
+    # Build adjacent-tile descriptions per node
+    adj_tiles = state.get("adjacent_tiles", {})
+    nodes = state.get("nodes", {})
+    robber = state.get("robber_coordinate")
+
+    def _tile_label(t):
+        res = t.get("resource")
+        num = t.get("number")
+        if not res:
+            return None
+        return f"{res}({num})" if num else res
+
+    # Separate nodes into occupied vs empty (only show nodes touching resources)
+    occupied = []
+    empty = []
+    for nid in sorted(adj_tiles.keys(), key=lambda x: int(x)):
+        tiles_info = adj_tiles[nid]
+        labels = [_tile_label(t) for t in tiles_info if _tile_label(t)]
+        if not labels:
+            continue
+
+        node = nodes.get(nid, {})
+        building = node.get("building")
+        color = node.get("color")
+        port = node_port.get(nid)
+
+        entry = {"id": nid, "labels": labels, "building": building, "color": color, "port": port}
+        if building:
+            occupied.append(entry)
+        else:
+            empty.append(entry)
+
+    def _format_node(e):
+        line = f"  Node {e['id']}: {', '.join(e['labels'])}"
+        tags = []
+        if e["building"]:
+            tags.append(f"{e['color']} {e['building']}")
+        if e["port"]:
+            tags.append(f"port {e['port']}")
+        if tags:
+            line += f"  [{' | '.join(tags)}]"
+        return line
+
+    if occupied:
+        _section("Settlements & Cities")
+        for e in occupied:
+            print(_format_node(e))
+
+    if empty:
+        _section("Open Nodes")
+        for e in empty:
+            print(_format_node(e))
 
     # Roads
     roads = []
@@ -746,9 +792,8 @@ def cmd_board(args):
         for r in roads:
             print(f"  Edge {r['id']}: {r['color']}")
 
-    robber = state.get("robber_coordinate")
     if robber:
-        print(f"\n  Robber: {robber}")
+        print(f"\n  Kraken: {robber}")
 
 
 def cmd_chat(args):
