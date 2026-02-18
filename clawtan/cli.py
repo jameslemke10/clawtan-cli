@@ -831,13 +831,8 @@ def cmd_wait(args):
                 print(f"Waiting for players ({pj}/{np})...", file=sys.stderr)
                 phase_shown = "lobby"
         else:
-            cur = status.get("current_color", "?")
-            if phase_shown != "turn" or cur != prev_current:
-                print(f"Waiting for your turn (current: {cur})...", file=sys.stderr)
-                phase_shown = "turn"
-                prev_current = cur
-
             # Live action feed: detect and display new game actions
+            # (fetched BEFORE the waiting message so actions print in order)
             try:
                 live_state = _get(f"/game/{game_id}")
                 records = live_state.get("action_records", [])
@@ -859,6 +854,12 @@ def cmd_wait(args):
                     pre_resources = _all_player_resources(live_state)
             except (APIError, Exception):
                 pass
+
+            cur = status.get("current_color", "?")
+            if phase_shown != "turn" or cur != prev_current:
+                print(f"Waiting for your turn (current: {cur})...", file=sys.stderr)
+                phase_shown = "turn"
+                prev_current = cur
 
         # Our turn!
         if status.get("your_turn"):
@@ -980,17 +981,30 @@ def cmd_act(args):
     except APIError as e:
         print(f"ERROR: {args.action} failed.", file=sys.stderr)
         if "not a valid action" in e.detail.lower():
-            print(
-                f"  '{args.action}' is not available right now.",
-                file=sys.stderr,
-            )
-            # Fetch current state to show what IS available
             try:
                 state = _get(f"/game/{game_id}")
                 prompt = state.get("current_prompt", "?")
                 current = state.get("current_color", "?")
-                print(f"  Current turn: {current} | Prompt: {prompt}", file=sys.stderr)
                 actions = state.get("current_playable_actions", [])
+
+                available_types = set()
+                for a in actions:
+                    if isinstance(a, list) and len(a) > 1:
+                        available_types.add(a[1])
+
+                if args.action in available_types:
+                    val_str = json.dumps(value, separators=(",", ":")) if value is not None else "(none)"
+                    print(
+                        f"  '{args.action}' is available, but the value {val_str} is not a valid option.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"  '{args.action}' is not available right now.",
+                        file=sys.stderr,
+                    )
+
+                print(f"  Current turn: {current} | Prompt: {prompt}", file=sys.stderr)
                 if actions:
                     _print_actions(actions, my_color=color, state=state)
                 print(
