@@ -14,10 +14,20 @@ Typical agent flow:
     clawtan act END_TIDE
     clawtan wait             # next turn...
 
+Multi-player on one machine (each terminal):
+    clawtan join <GAME_ID>                  # join, note your assigned color
+    export CLAWTAN_COLOR=<COLOR>            # lock this terminal to your player
+    clawtan wait                            # now uses the correct session
+
+  Or use --player on every call (works with separate exec calls):
+    clawtan --player BLUE wait
+    clawtan --player BLUE act ROLL_THE_SHELLS
+
 Session lookup order (per field):
     1. CLI flags (--game, --token, --color)
     2. Environment variables (CLAWTAN_GAME, CLAWTAN_TOKEN, CLAWTAN_COLOR)
-    3. Session file (~/.clawtan_session, override with CLAWTAN_SESSION_FILE)
+    3. Session file (~/.clawtan_session_<COLOR> if CLAWTAN_COLOR is set,
+       otherwise ~/.clawtan_session; override with CLAWTAN_SESSION_FILE)
 """
 
 import argparse
@@ -127,26 +137,49 @@ def _get(path, token=None):
 # Session file helpers
 # ---------------------------------------------------------------------------
 def _session_path() -> str:
-    return os.environ.get("CLAWTAN_SESSION_FILE") or os.path.expanduser("~/.clawtan_session")
+    custom = os.environ.get("CLAWTAN_SESSION_FILE")
+    if custom:
+        return custom
+    color = os.environ.get("CLAWTAN_COLOR")
+    if color:
+        per_color = os.path.expanduser(f"~/.clawtan_session_{color}")
+        if os.path.exists(per_color):
+            return per_color
+    return os.path.expanduser("~/.clawtan_session")
 
 
 def _save_session(game_id: str, token: str, color: str):
-    path = _session_path()
     data = {"GAME": game_id, "TOKEN": token, "COLOR": color}
+    # Per-color session file (enables multi-player on the same machine)
+    color_path = os.path.expanduser(f"~/.clawtan_session_{color}")
     try:
-        with open(path, "w") as f:
+        with open(color_path, "w") as f:
             json.dump(data, f)
     except OSError as e:
-        print(f"Warning: could not save session to {path}: {e}", file=sys.stderr)
+        print(f"Warning: could not save session to {color_path}: {e}", file=sys.stderr)
+    # Default session file (single-player convenience / backwards compat)
+    default_path = os.environ.get("CLAWTAN_SESSION_FILE") or os.path.expanduser("~/.clawtan_session")
+    try:
+        with open(default_path, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+_SESSION_CACHE: dict | None = None
 
 
 def _load_session() -> dict:
+    global _SESSION_CACHE
+    if _SESSION_CACHE is not None:
+        return _SESSION_CACHE
     path = _session_path()
     try:
         with open(path) as f:
-            return json.load(f)
+            _SESSION_CACHE = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return {}
+        _SESSION_CACHE = {}
+    return _SESSION_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -493,8 +526,11 @@ def _print_join(resp: dict):
     print(f"  Started: {'yes' if resp.get('game_started') else 'no'}")
 
     _save_session(resp["game_id"], resp["token"], resp["player_color"])
-    print(f"\n  Session saved to {_session_path()}")
-    print(f"  All subsequent clawtan commands will use this session automatically.")
+    color = resp["player_color"]
+    print(f"\n  Session saved.")
+    print(f"\n  To lock this terminal to your player, run:")
+    print(f"    export CLAWTAN_COLOR={color}")
+    print(f"\n  This is required when multiple players share a machine.")
 
 
 def cmd_wait(args):
@@ -939,6 +975,11 @@ def main():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument(
+        "--player",
+        metavar="COLOR",
+        help="Player color — selects the per-player session file (for multi-player on one machine)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # -- create --------------------------------------------------------
@@ -1088,6 +1129,8 @@ def main():
 
     # -- Parse and run -------------------------------------------------
     args = parser.parse_args()
+    if args.player:
+        os.environ["CLAWTAN_COLOR"] = args.player
     try:
         args.func(args)
     except APIError as e:
