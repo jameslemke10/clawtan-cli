@@ -23,11 +23,15 @@ Multi-player on one machine (each terminal):
     clawtan --player BLUE wait
     clawtan --player BLUE act ROLL_THE_SHELLS
 
+  Same color in multiple games — add --game:
+    clawtan --player RED wait --game <GAME_ID>
+
 Session lookup order (per field):
-    1. CLI flags (--game, --token, --color)
+    1. CLI flags (--game, --token, --color, --player)
     2. Environment variables (CLAWTAN_GAME, CLAWTAN_TOKEN, CLAWTAN_COLOR)
-    3. Session file (~/.clawtan_session_<COLOR> if CLAWTAN_COLOR is set,
-       otherwise ~/.clawtan_session; override with CLAWTAN_SESSION_FILE)
+    3. Session file: ~/.clawtan_sessions/<game>_<color>.json matched by
+       available hints, falling back to ~/.clawtan_session.
+       Override with CLAWTAN_SESSION_FILE.
 """
 
 import argparse
@@ -136,65 +140,97 @@ def _get(path, token=None):
 # ---------------------------------------------------------------------------
 # Session file helpers
 # ---------------------------------------------------------------------------
-def _session_path() -> str:
-    custom = os.environ.get("CLAWTAN_SESSION_FILE")
-    if custom:
-        return custom
-    color = os.environ.get("CLAWTAN_COLOR")
-    if color:
-        per_color = os.path.expanduser(f"~/.clawtan_session_{color}")
-        if os.path.exists(per_color):
-            return per_color
-    return os.path.expanduser("~/.clawtan_session")
+_SESSIONS_DIR = os.path.expanduser("~/.clawtan_sessions")
 
 
 def _save_session(game_id: str, token: str, color: str):
     data = {"GAME": game_id, "TOKEN": token, "COLOR": color}
-    # Per-color session file (enables multi-player on the same machine)
-    color_path = os.path.expanduser(f"~/.clawtan_session_{color}")
+    os.makedirs(_SESSIONS_DIR, exist_ok=True)
+    path = os.path.join(_SESSIONS_DIR, f"{game_id}_{color}.json")
     try:
-        with open(color_path, "w") as f:
+        with open(path, "w") as f:
             json.dump(data, f)
     except OSError as e:
-        print(f"Warning: could not save session to {color_path}: {e}", file=sys.stderr)
-    # Default session file (single-player convenience / backwards compat)
-    default_path = os.environ.get("CLAWTAN_SESSION_FILE") or os.path.expanduser("~/.clawtan_session")
+        print(f"Warning: could not save session to {path}: {e}", file=sys.stderr)
+    default = os.environ.get("CLAWTAN_SESSION_FILE") or os.path.expanduser("~/.clawtan_session")
     try:
-        with open(default_path, "w") as f:
+        with open(default, "w") as f:
             json.dump(data, f)
     except OSError:
         pass
 
 
-_SESSION_CACHE: dict | None = None
+def _find_session(game_hint: str | None = None, color_hint: str | None = None) -> dict:
+    """Find a session file using available game/color hints."""
+    custom = os.environ.get("CLAWTAN_SESSION_FILE")
+    if custom:
+        try:
+            with open(custom) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
 
+    if game_hint and color_hint:
+        path = os.path.join(_SESSIONS_DIR, f"{game_hint}_{color_hint}.json")
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
 
-def _load_session() -> dict:
-    global _SESSION_CACHE
-    if _SESSION_CACHE is not None:
-        return _SESSION_CACHE
-    path = _session_path()
+    if (game_hint or color_hint) and os.path.isdir(_SESSIONS_DIR):
+        matches = []
+        for fname in os.listdir(_SESSIONS_DIR):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(_SESSIONS_DIR, fname)) as f:
+                    data = json.load(f)
+                if game_hint and data.get("GAME") != game_hint:
+                    continue
+                if color_hint and data.get("COLOR") != color_hint:
+                    continue
+                matches.append(data)
+            except (OSError, json.JSONDecodeError):
+                continue
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return matches[0]
+
+    default = os.path.expanduser("~/.clawtan_session")
     try:
-        with open(path) as f:
-            _SESSION_CACHE = json.load(f)
+        with open(default) as f:
+            return json.load(f)
     except (OSError, json.JSONDecodeError):
-        _SESSION_CACHE = {}
-    return _SESSION_CACHE
+        return {}
 
 
 # ---------------------------------------------------------------------------
-# Environment / session variable helpers
+# Session resolution
 # ---------------------------------------------------------------------------
-def _env(name: str, arg_val=None, required=True):
-    # 1. CLI flag
-    val = arg_val
-    # 2. Environment variable
+def _resolve_session(arg_game=None, arg_token=None, arg_color=None):
+    """Resolve game, token, color from flags -> env vars -> session file.
+
+    Uses all available hints together to find the correct session file,
+    which avoids ambiguity when multiple games or players share a machine.
+    """
+    game = arg_game or os.environ.get("CLAWTAN_GAME") or None
+    token = arg_token or os.environ.get("CLAWTAN_TOKEN") or None
+    color = arg_color or os.environ.get("CLAWTAN_COLOR") or None
+
+    if not (game and token and color):
+        session = _find_session(game_hint=game, color_hint=color)
+        game = game or session.get("GAME")
+        token = token or session.get("TOKEN")
+        color = color or session.get("COLOR")
+
+    return game, token, color
+
+
+def _require(name: str, val):
+    """Exit with error if a required session value is missing."""
     if not val:
-        val = os.environ.get(f"CLAWTAN_{name}")
-    # 3. Session file
-    if not val:
-        val = _load_session().get(name)
-    if required and not val:
         print(
             f"ERROR: Missing {name}. Pass --{name.lower()}, set CLAWTAN_{name},"
             f" or run 'clawtan quick-join' to create a session.",
@@ -526,17 +562,20 @@ def _print_join(resp: dict):
     print(f"  Started: {'yes' if resp.get('game_started') else 'no'}")
 
     _save_session(resp["game_id"], resp["token"], resp["player_color"])
+    gid = resp["game_id"]
     color = resp["player_color"]
-    print(f"\n  Session saved.")
-    print(f"\n  To lock this terminal to your player, run:")
-    print(f"    export CLAWTAN_COLOR={color}")
-    print(f"\n  This is required when multiple players share a machine.")
+    print(f"\n  Session saved to ~/.clawtan_sessions/{gid}_{color}.json")
+    print(f"\n  Multi-player setup — pick ONE option:")
+    print(f"    export CLAWTAN_COLOR={color}                 # env var per terminal")
+    print(f"    clawtan --player {color} <command>           # flag per command")
+    print(f"    clawtan --player {color} wait --game {gid}   # if same color in multiple games")
 
 
 def cmd_wait(args):
-    game_id = _env("GAME", args.game)
-    token = _env("TOKEN", args.token)
-    color = _env("COLOR", args.color)
+    game_id, token, color = _resolve_session(args.game, args.token, args.color)
+    _require("GAME", game_id)
+    _require("TOKEN", token)
+    _require("COLOR", color)
     poll = args.poll
     deadline = time.monotonic() + args.timeout
 
@@ -688,9 +727,10 @@ def _print_roll_result(state: dict, pre_resources: dict | None):
 
 
 def cmd_act(args):
-    game_id = _env("GAME", args.game)
-    token = _env("TOKEN", args.token)
-    color = _env("COLOR", args.color)
+    game_id, token, color = _resolve_session(args.game, args.token, args.color)
+    _require("GAME", game_id)
+    _require("TOKEN", token)
+    _require("COLOR", color)
 
     # Snapshot resources before rolling so we can diff afterwards
     pre_resources = None
@@ -788,8 +828,8 @@ def cmd_act(args):
 
 
 def cmd_status(args):
-    game_id = _env("GAME", args.game)
-    token = _env("TOKEN", args.token, required=False)
+    game_id, token, _ = _resolve_session(args.game, args.token)
+    _require("GAME", game_id)
 
     status = _get(f"/game/{game_id}/status", token=token)
 
@@ -813,7 +853,8 @@ def cmd_status(args):
 
 
 def cmd_board(args):
-    game_id = _env("GAME", args.game)
+    game_id, _, _ = _resolve_session(args.game)
+    _require("GAME", game_id)
     state = _get(f"/game/{game_id}")
 
     if not state.get("started") or not state.get("tiles"):
@@ -943,14 +984,16 @@ def cmd_board(args):
 
 
 def cmd_chat(args):
-    game_id = _env("GAME", args.game)
-    token = _env("TOKEN", args.token)
+    game_id, token, _ = _resolve_session(args.game, args.token)
+    _require("GAME", game_id)
+    _require("TOKEN", token)
     _post(f"/game/{game_id}/chat", {"message": args.message}, token=token)
     print("Chat sent.")
 
 
 def cmd_chat_read(args):
-    game_id = _env("GAME", args.game)
+    game_id, _, _ = _resolve_session(args.game)
+    _require("GAME", game_id)
     resp = _get(f"/game/{game_id}/chat?since={args.since}")
     msgs = resp.get("messages", [])
     if msgs:
