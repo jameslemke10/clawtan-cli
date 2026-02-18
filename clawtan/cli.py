@@ -396,7 +396,7 @@ _ACTION_HINTS = {
         "    CLI: clawtan act RELEASE_CATCH"
     ),
     "MOVE_THE_KRAKEN": (
-        "Move robber: value = [coordinate, victim_color_or_null, null].\n"
+        "Move Kraken: value = [coordinate, victim_color_or_null, null].\n"
         "    CLI: clawtan act MOVE_THE_KRAKEN '[[0,1,-1],\"BLUE\",null]'"
     ),
     "OCEAN_TRADE": (
@@ -411,7 +411,101 @@ _ACTION_HINTS = {
 }
 
 
-def _print_actions(actions: list, my_color: str | None = None):
+def _player_network(state: dict, color: str) -> set:
+    """Return the set of node ID strings that belong to a player's network."""
+    nodes = state.get("nodes", {})
+    network = set()
+    for nid, node in nodes.items():
+        if node.get("color") == color:
+            network.add(str(nid))
+    for e in state.get("edges", []):
+        if e.get("color") == color:
+            eid = e.get("id")
+            if isinstance(eid, list) and len(eid) == 2:
+                network.add(str(eid[0]))
+                network.add(str(eid[1]))
+    return network
+
+
+def _node_resource_label(state: dict, nid) -> str:
+    """Return a compact resource description for a node, e.g. 'SHRIMP(4), KELP(2)'."""
+    adj_tiles = state.get("adjacent_tiles", {})
+    tiles_info = adj_tiles.get(str(nid), [])
+    labels = []
+    for t in tiles_info:
+        res = t.get("resource")
+        num = t.get("number")
+        if res:
+            labels.append(f"{res}({num})" if num else res)
+    return ", ".join(labels)
+
+
+def _edge_annotation(edge_val, state: dict, color: str) -> str:
+    """Annotate a BUILD_CURRENT edge with network context and destination resources."""
+    if not isinstance(edge_val, list) or len(edge_val) != 2 or not state:
+        return ""
+
+    a_str, b_str = str(edge_val[0]), str(edge_val[1])
+    network = _player_network(state, color)
+    nodes = state.get("nodes", {})
+
+    a_mine = a_str in network
+    b_mine = b_str in network
+
+    if a_mine and b_mine:
+        return "  (connects your network)"
+
+    if a_mine:
+        from_id, to_id = a_str, b_str
+    elif b_mine:
+        from_id, to_id = b_str, a_str
+    else:
+        return ""
+
+    from_node = nodes.get(from_id, {})
+    building = from_node.get("building")
+    if building and from_node.get("color") == color:
+        tag = "your " + building.lower()
+    else:
+        tag = "your road"
+
+    to_label = _node_resource_label(state, to_id)
+    port_nodes = state.get("port_nodes", {})
+    port = None
+    for res_or_any, nids in port_nodes.items():
+        if int(to_id) in nids:
+            port = "3:1" if res_or_any == "ANY" else f"2:1 {res_or_any}"
+            break
+    if port and to_label:
+        return f"  from {from_id} ({tag}) → {to_id}: {to_label} [port {port}]"
+    if to_label:
+        return f"  from {from_id} ({tag}) → {to_id}: {to_label}"
+    return f"  from {from_id} ({tag}) → {to_id}"
+
+
+def _node_annotation(node_val, state: dict) -> str:
+    """Annotate a BUILD_TIDE_POOL node with resources and port info."""
+    if state is None:
+        return ""
+    nid = str(node_val)
+    label = _node_resource_label(state, nid)
+    port_nodes = state.get("port_nodes", {})
+    port = None
+    for res_or_any, nids in port_nodes.items():
+        if int(nid) in nids:
+            port = "3:1" if res_or_any == "ANY" else f"2:1 {res_or_any}"
+            break
+    parts = []
+    if label:
+        parts.append(label)
+    if port:
+        parts.append(f"port {port}")
+    if parts:
+        return "  " + ", ".join(parts)
+    return ""
+
+
+def _print_actions(actions: list, my_color: str | None = None, state: dict | None = None):
     _section("Available Actions")
 
     my_actions = []
@@ -434,12 +528,25 @@ def _print_actions(actions: list, my_color: str | None = None):
         val = a[2] if isinstance(a, list) and len(a) > 2 else None
         grouped[atype].append(val)
 
+    annotated_types = {"BUILD_CURRENT", "BUILD_TIDE_POOL", "BUILD_REEF"}
+
     for atype, values in grouped.items():
         hint = _ACTION_HINTS.get(atype)
         if all(v is None for v in values):
             print(f"  {atype}")
             if hint:
                 print(f"    ({hint})")
+        elif state and my_color and atype in annotated_types:
+            print(f"  {atype} ({len(values)} options):")
+            if hint:
+                print(f"    ({hint})")
+            for v in values:
+                f = json.dumps(v, separators=(",", ":"))
+                if atype == "BUILD_CURRENT":
+                    ann = _edge_annotation(v, state, my_color)
+                else:
+                    ann = _node_annotation(v, state)
+                print(f"    {f}{ann}")
         else:
             formatted = [json.dumps(v, separators=(",", ":")) for v in values]
             if hint:
@@ -493,6 +600,94 @@ def _print_history(records: list, since: int = 0):
                 print(f"  {color}: {action}")
         else:
             print(f"  {r}")
+
+
+def _format_live_action(color, action, val, state=None, pre_resources=None):
+    """Format a game action as a human-readable live update line."""
+    ts = time.strftime("%H:%M:%S")
+
+    if action == "ROLL_THE_SHELLS":
+        if isinstance(val, list) and len(val) == 2:
+            line = f"  [{ts}] {color} rolled {val[0]}+{val[1]}={sum(val)}"
+        elif val is not None:
+            line = f"  [{ts}] {color} rolled {val}"
+        else:
+            line = f"  [{ts}] {color} rolled the shells"
+        if pre_resources and state:
+            post = _all_player_resources(state)
+            parts = []
+            for c in state.get("colors", []):
+                gains = []
+                for res in RESOURCES:
+                    diff = post.get(c, {}).get(res, 0) - pre_resources.get(c, {}).get(res, 0)
+                    if diff > 0:
+                        gains.append(f"+{diff} {res}")
+                    elif diff < 0:
+                        gains.append(f"{diff} {res}")
+                if gains:
+                    parts.append(f"           {c}: {', '.join(gains)}")
+            if parts:
+                line += "\n" + "\n".join(parts)
+            else:
+                line += " — no resources produced"
+        return line
+
+    if action == "MOVE_THE_KRAKEN":
+        tile = val
+        victim = None
+        if isinstance(val, list) and len(val) >= 2:
+            tile = val[0]
+            victim = val[1]
+        if victim:
+            return f"  [{ts}] {color} moved the Kraken to {tile}, stealing from {victim}"
+        return f"  [{ts}] {color} moved the Kraken to {tile}"
+
+    if action == "BUILD_TIDE_POOL":
+        return f"  [{ts}] {color} built a settlement" + (f" on node {val}" if val is not None else "")
+
+    if action == "BUILD_REEF":
+        return f"  [{ts}] {color} upgraded to a city" + (f" on node {val}" if val is not None else "")
+
+    if action == "BUILD_CURRENT":
+        return f"  [{ts}] {color} built a road" + (f" on edge {val}" if val is not None else "")
+
+    if action == "BUY_TREASURE_MAP":
+        return f"  [{ts}] {color} bought a development card"
+
+    if action == "SUMMON_LOBSTER_GUARD":
+        return f"  [{ts}] {color} played a Knight"
+
+    if action == "RELEASE_CATCH":
+        return f"  [{ts}] {color} discarded resources"
+
+    if action == "PLAY_BOUNTIFUL_HARVEST":
+        if isinstance(val, list):
+            return f"  [{ts}] {color} played Year of Plenty: {', '.join(str(v) for v in val)}"
+        return f"  [{ts}] {color} played Year of Plenty"
+
+    if action == "PLAY_TIDAL_MONOPOLY":
+        return f"  [{ts}] {color} played Monopoly" + (f" on {val}" if val else "")
+
+    if action == "PLAY_CURRENT_BUILDING":
+        return f"  [{ts}] {color} played Road Building"
+
+    if action == "OCEAN_TRADE":
+        if isinstance(val, list) and len(val) >= 2:
+            giving = val[:-1]
+            receiving = val[-1]
+            give_counts = {}
+            for r in giving:
+                give_counts[r] = give_counts.get(r, 0) + 1
+            give_str = ", ".join(f"{n}x {r}" for r, n in give_counts.items())
+            return f"  [{ts}] {color} traded {give_str} for 1x {receiving}"
+        return f"  [{ts}] {color} made a trade"
+
+    if action == "END_TIDE":
+        return f"  [{ts}] {color} ended their turn"
+
+    if val is not None:
+        return f"  [{ts}] {color}: {action} {json.dumps(val, separators=(',', ':'))}"
+    return f"  [{ts}] {color}: {action}"
 
 
 def _count_turns(state: dict) -> int:
@@ -582,10 +777,12 @@ def cmd_wait(args):
     # Snapshot current history/chat counts so we can show "what's new"
     history_len = 0
     chat_since = 0
+    pre_resources = None
     try:
         state = _get(f"/game/{game_id}")
         if state.get("started"):
             history_len = len(state.get("action_records", []))
+            pre_resources = _all_player_resources(state)
         chat_resp = _get(f"/game/{game_id}/chat")
         chat_since = len(chat_resp.get("messages", []))
     except (APIError, Exception):
@@ -593,6 +790,8 @@ def cmd_wait(args):
 
     # Poll loop
     phase_shown = None
+    prev_current = None
+    live_header_shown = False
     while True:
         try:
             status = _get(f"/game/{game_id}/status", token=token)
@@ -611,7 +810,6 @@ def cmd_wait(args):
             _header("GAME OVER")
             winner = status["winning_color"]
             print(f"  Winner: {winner}")
-            # Fetch final state for scores
             try:
                 state = _get(f"/game/{game_id}")
                 colors = state.get("colors", [])
@@ -633,10 +831,34 @@ def cmd_wait(args):
                 print(f"Waiting for players ({pj}/{np})...", file=sys.stderr)
                 phase_shown = "lobby"
         else:
-            if phase_shown != "turn":
-                cur = status.get("current_color", "?")
+            cur = status.get("current_color", "?")
+            if phase_shown != "turn" or cur != prev_current:
                 print(f"Waiting for your turn (current: {cur})...", file=sys.stderr)
                 phase_shown = "turn"
+                prev_current = cur
+
+            # Live action feed: detect and display new game actions
+            try:
+                live_state = _get(f"/game/{game_id}")
+                records = live_state.get("action_records", [])
+                new_count = len(records)
+                if new_count > history_len:
+                    if not live_header_shown:
+                        print("── Game Progress ──", file=sys.stderr)
+                        live_header_shown = True
+                    for r in records[history_len:new_count]:
+                        c, a, v = _unpack_record(r)
+                        if c and a:
+                            desc = _format_live_action(
+                                c, a, v,
+                                state=live_state,
+                                pre_resources=pre_resources,
+                            )
+                            print(desc, file=sys.stderr)
+                    history_len = new_count
+                    pre_resources = _all_player_resources(live_state)
+            except (APIError, Exception):
+                pass
 
         # Our turn!
         if status.get("your_turn"):
@@ -680,11 +902,11 @@ def cmd_wait(args):
 
     actions = state.get("current_playable_actions", [])
     if actions:
-        _print_actions(actions, my_color=color)
+        _print_actions(actions, my_color=color, state=state)
 
     robber = state.get("robber_coordinate")
     if robber:
-        print(f"\n  Robber: {robber}")
+        print(f"\n  Kraken: {robber}")
 
 
 def _print_roll_result(state: dict, pre_resources: dict | None):
@@ -770,7 +992,7 @@ def cmd_act(args):
                 print(f"  Current turn: {current} | Prompt: {prompt}", file=sys.stderr)
                 actions = state.get("current_playable_actions", [])
                 if actions:
-                    _print_actions(actions, my_color=color)
+                    _print_actions(actions, my_color=color, state=state)
                 print(
                     "\n  Tip: run 'clawtan wait' to get a full turn briefing with available actions.",
                     file=sys.stderr,
@@ -815,14 +1037,14 @@ def cmd_act(args):
             _print_resources(my["resources"])
 
         if my_actions:
-            _print_actions(actions, my_color=color)
+            _print_actions(actions, my_color=color, state=state)
         else:
             print("\n  No actions available.")
     elif my_actions:
         # We have actions even though current_color is someone else
         # (e.g. we also need to discard on a 7)
         print(f"  Prompt: {prompt}")
-        _print_actions(actions, my_color=color)
+        _print_actions(actions, my_color=color, state=state)
     else:
         print(f"\n  Action done. No more actions available. Run 'clawtan wait' for your next turn or action required.")
 
@@ -979,8 +1201,23 @@ def cmd_board(args):
         for r in roads:
             print(f"  Edge {r['id']}: {r['color']}")
 
+    # Node adjacency graph for road planning
+    adjacency = defaultdict(list)
+    for e in state.get("edges", []):
+        eid = e.get("id")
+        if isinstance(eid, list) and len(eid) == 2:
+            a, b = str(eid[0]), str(eid[1])
+            adjacency[a].append(b)
+            adjacency[b].append(a)
+
+    if adjacency:
+        _section("Node Graph (edges)")
+        for nid in sorted(adjacency.keys(), key=lambda x: int(x)):
+            neighbors = sorted(adjacency[nid], key=lambda x: int(x))
+            print(f"  {nid}: {', '.join(neighbors)}")
+
     if robber:
-        print(f"\n  Robber: {robber}")
+        print(f"\n  Kraken: {robber}")
 
 
 def cmd_chat(args):
@@ -1098,7 +1335,7 @@ def main():
             "  BUILD_CURRENT <edge>       Build road, e.g. '[3,7]'\n"
             "  BUY_TREASURE_MAP           Buy dev card\n"
             "  SUMMON_LOBSTER_GUARD       Play knight card\n"
-            "  MOVE_THE_KRAKEN <val>      Move robber, e.g. '[[0,1,-1],\"BLUE\",null]'\n"
+            "  MOVE_THE_KRAKEN <val>      Move Kraken, e.g. '[[0,1,-1],\"BLUE\",null]'\n"
             "  RELEASE_CATCH              Discard half your cards (server selects randomly)\n"
             "  PLAY_BOUNTIFUL_HARVEST <r> Year of Plenty, e.g. '[\"DRIFTWOOD\",\"CORAL\"]'\n"
             "  PLAY_TIDAL_MONOPOLY <res>  Monopoly, e.g. SHRIMP\n"
@@ -1142,7 +1379,7 @@ def main():
         help="Show board layout, buildings, and roads",
         description=(
             "Display the board: tiles with resources/numbers, ports,\n"
-            "buildings, roads, and robber location.\n"
+            "buildings, roads, and Kraken location.\n"
             "Tile layout is static after game start -- call once and remember it."
         ),
     )
