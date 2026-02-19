@@ -390,6 +390,15 @@ def _print_opponents(opponents: list):
         print(line)
 
 
+def _format_trade_tuple(val: list) -> str:
+    """Decode a 10-int trade tuple into 'give X for Y' text."""
+    giving = {RESOURCES[i]: val[i] for i in range(5) if val[i]}
+    wanting = {RESOURCES[i]: val[i + 5] for i in range(5) if val[i + 5]}
+    give_str = ", ".join(f"{n}x {r}" for r, n in giving.items()) or "nothing"
+    want_str = ", ".join(f"{n}x {r}" for r, n in wanting.items()) or "nothing"
+    return f"{give_str} for {want_str}"
+
+
 _ACTION_HINTS = {
     "RELEASE_CATCH": (
         "Discard half your cards (server selects randomly).\n"
@@ -407,6 +416,29 @@ _ACTION_HINTS = {
     "PLAY_BOUNTIFUL_HARVEST": (
         "Year of Plenty: pick 2 free resources.\n"
         "    CLI: clawtan act PLAY_BOUNTIFUL_HARVEST '[\"DRIFTWOOD\",\"CORAL\"]'"
+    ),
+    "OFFER_TRADE": (
+        "Offer a player-to-player trade. Value = 10-element list:\n"
+        "    first 5 = resources you GIVE [DRIFTWOOD,CORAL,SHRIMP,KELP,PEARL],\n"
+        "    last 5  = resources you WANT [DRIFTWOOD,CORAL,SHRIMP,KELP,PEARL].\n"
+        "    CLI: clawtan act OFFER_TRADE '[0,0,0,1,0,0,1,0,0,0]'  # give 1 KELP, want 1 CORAL"
+    ),
+    "ACCEPT_TRADE": (
+        "Accept a trade offer. Value = the 10-int trade tuple (echoed from the offer).\n"
+        "    CLI: clawtan act ACCEPT_TRADE '[0,0,0,1,0,0,1,0,0,0]'"
+    ),
+    "REJECT_TRADE": (
+        "Reject a trade offer. Value = the 10-int trade tuple (echoed from the offer).\n"
+        "    CLI: clawtan act REJECT_TRADE '[0,0,0,1,0,0,1,0,0,0]'"
+    ),
+    "CONFIRM_TRADE": (
+        "Confirm trade with a specific acceptee. Value = 11-element list:\n"
+        "    the 10-int trade tuple + the accepting player's color.\n"
+        "    CLI: clawtan act CONFIRM_TRADE '[0,0,0,1,0,0,1,0,0,0,\"BLUE\"]'"
+    ),
+    "CANCEL_TRADE": (
+        "Cancel your pending trade offer.\n"
+        "    CLI: clawtan act CANCEL_TRADE"
     ),
 }
 
@@ -670,6 +702,30 @@ def _format_live_action(color, action, val, state=None, pre_resources=None):
 
     if action == "PLAY_CURRENT_BUILDING":
         return f"  [{ts}] {color} played Road Building"
+
+    if action == "OFFER_TRADE":
+        if isinstance(val, list) and len(val) == 10:
+            return f"  [{ts}] {color} offered trade: {_format_trade_tuple(val)}"
+        return f"  [{ts}] {color} offered a trade"
+
+    if action == "ACCEPT_TRADE":
+        if isinstance(val, list) and len(val) == 10:
+            return f"  [{ts}] {color} accepted trade: {_format_trade_tuple(val)}"
+        return f"  [{ts}] {color} accepted a trade"
+
+    if action == "REJECT_TRADE":
+        if isinstance(val, list) and len(val) == 10:
+            return f"  [{ts}] {color} rejected trade: {_format_trade_tuple(val)}"
+        return f"  [{ts}] {color} rejected a trade"
+
+    if action == "CONFIRM_TRADE":
+        if isinstance(val, list) and len(val) == 11:
+            partner = val[10]
+            return f"  [{ts}] {color} confirmed trade with {partner}: {_format_trade_tuple(val[:10])}"
+        return f"  [{ts}] {color} confirmed a trade"
+
+    if action == "CANCEL_TRADE":
+        return f"  [{ts}] {color} cancelled their trade offer"
 
     if action == "OCEAN_TRADE":
         if isinstance(val, list) and len(val) >= 2:
@@ -1354,7 +1410,14 @@ def main():
             "  PLAY_BOUNTIFUL_HARVEST <r> Year of Plenty, e.g. '[\"DRIFTWOOD\",\"CORAL\"]'\n"
             "  PLAY_TIDAL_MONOPOLY <res>  Monopoly, e.g. SHRIMP\n"
             "  PLAY_CURRENT_BUILDING      Road Building\n"
-            "  OCEAN_TRADE <val>          Trade, e.g. '[\"KELP\",\"KELP\",\"KELP\",\"KELP\",\"SHRIMP\"]'\n"
+            "  OFFER_TRADE <val>          Player trade: 10-element list [give5, want5]\n"
+            "                               e.g. '[0,0,0,1,0,0,1,0,0,0]' = give 1 KELP, want 1 CORAL\n"
+            "  ACCEPT_TRADE <val>         Accept a trade offer (echo the 10-int tuple)\n"
+            "  REJECT_TRADE <val>         Reject a trade offer (echo the 10-int tuple)\n"
+            "  CONFIRM_TRADE <val>        Confirm with acceptee: 10 ints + color, e.g.\n"
+            "                               '[0,0,0,1,0,0,1,0,0,0,\"BLUE\"]'\n"
+            "  CANCEL_TRADE               Cancel your pending trade offer\n"
+            "  OCEAN_TRADE <val>          Maritime trade, e.g. '[\"KELP\",\"KELP\",\"KELP\",\"KELP\",\"SHRIMP\"]'\n"
             "  END_TIDE                   End your turn\n"
             "\n"
             "VALUE is parsed as JSON. Bare words (e.g. SHRIMP) are treated as strings.\n"
