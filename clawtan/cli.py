@@ -391,7 +391,11 @@ def _print_opponents(opponents: list):
 
 
 def _format_trade_tuple(val: list) -> str:
-    """Decode a 10-int trade tuple into 'give X for Y' text."""
+    """Decode trade resources (first 10 elements) into 'give X for Y' text.
+
+    Works for 10-element (OFFER_TRADE) and 11-element (current_trade,
+    ACCEPT/REJECT/CONFIRM) tuples — extra elements are ignored.
+    """
     giving = {RESOURCES[i]: val[i] for i in range(5) if val[i]}
     wanting = {RESOURCES[i]: val[i + 5] for i in range(5) if val[i + 5]}
     give_str = ", ".join(f"{n}x {r}" for r, n in giving.items()) or "nothing"
@@ -424,16 +428,20 @@ _ACTION_HINTS = {
         "    CLI: clawtan act OFFER_TRADE '[0,0,0,1,0,0,1,0,0,0]'  # give 1 KELP, want 1 CORAL"
     ),
     "ACCEPT_TRADE": (
-        "Accept a trade offer. Value = the 10-int trade tuple (echoed from the offer).\n"
-        "    CLI: clawtan act ACCEPT_TRADE '[0,0,0,1,0,0,1,0,0,0]'"
+        "Accept a trade offer. Value = 11-element current_trade tuple\n"
+        "    (10 resource ints + offerer's turn index, echoed from the offer).\n"
+        "    Just use the value shown in your available actions.\n"
+        "    CLI: clawtan act ACCEPT_TRADE '[0,0,0,1,0,0,1,0,0,0,0]'"
     ),
     "REJECT_TRADE": (
-        "Reject a trade offer. Value = the 10-int trade tuple (echoed from the offer).\n"
-        "    CLI: clawtan act REJECT_TRADE '[0,0,0,1,0,0,1,0,0,0]'"
+        "Reject a trade offer. Value = 11-element current_trade tuple\n"
+        "    (10 resource ints + offerer's turn index, echoed from the offer).\n"
+        "    Just use the value shown in your available actions.\n"
+        "    CLI: clawtan act REJECT_TRADE '[0,0,0,1,0,0,1,0,0,0,0]'"
     ),
     "CONFIRM_TRADE": (
         "Confirm trade with a specific acceptee. Value = 11-element list:\n"
-        "    the 10-int trade tuple + the accepting player's color.\n"
+        "    the 10 resource ints + the accepting player's color.\n"
         "    CLI: clawtan act CONFIRM_TRADE '[0,0,0,1,0,0,1,0,0,0,\"BLUE\"]'"
     ),
     "CANCEL_TRADE": (
@@ -599,6 +607,37 @@ def _print_actions(actions: list, my_color: str | None = None, state: dict | Non
         print(f"\n  (other players still need to act: {', '.join(sorted(other_colors))})")
 
 
+def _print_trade_context(state: dict, my_color: str):
+    """Show the active trade offer and who has accepted so far."""
+    trade = state.get("current_trade")
+    if not trade or not isinstance(trade, list) or len(trade) < 10:
+        return
+
+    prompt = state.get("current_prompt", "")
+    colors = state.get("colors", [])
+    offerer_idx = trade[10] if len(trade) > 10 else None
+    offerer = colors[offerer_idx] if offerer_idx is not None and offerer_idx < len(colors) else "?"
+
+    _section("Active Trade")
+    print(f"  Offered by: {offerer}")
+    print(f"  Trade: {_format_trade_tuple(trade)}")
+
+    if prompt == "DECIDE_TRADE":
+        if offerer == my_color:
+            print("  Waiting for other players to accept or reject.")
+        else:
+            print("  You must ACCEPT_TRADE or REJECT_TRADE.")
+    elif prompt == "DECIDE_ACCEPTEES":
+        acceptees = state.get("acceptees", [])
+        accepted = [colors[i] for i, a in enumerate(acceptees) if a and i < len(colors)]
+        if accepted:
+            print(f"  Accepted by: {', '.join(accepted)}")
+        else:
+            print("  No one accepted.")
+        if offerer == my_color:
+            print("  You may CONFIRM_TRADE with an acceptee or CANCEL_TRADE.")
+
+
 def _unpack_record(r):
     """Unpack an action record into (color, action_type, value).
 
@@ -709,12 +748,12 @@ def _format_live_action(color, action, val, state=None, pre_resources=None):
         return f"  [{ts}] {color} offered a trade"
 
     if action == "ACCEPT_TRADE":
-        if isinstance(val, list) and len(val) == 10:
+        if isinstance(val, list) and len(val) >= 10:
             return f"  [{ts}] {color} accepted trade: {_format_trade_tuple(val)}"
         return f"  [{ts}] {color} accepted a trade"
 
     if action == "REJECT_TRADE":
-        if isinstance(val, list) and len(val) == 10:
+        if isinstance(val, list) and len(val) >= 10:
             return f"  [{ts}] {color} rejected trade: {_format_trade_tuple(val)}"
         return f"  [{ts}] {color} rejected a trade"
 
@@ -957,6 +996,9 @@ def cmd_wait(args):
     except (APIError, Exception):
         pass
 
+    if state.get("is_resolving_trade"):
+        _print_trade_context(state, color)
+
     actions = state.get("current_playable_actions", [])
     if actions:
         _print_actions(actions, my_color=color, state=state)
@@ -1106,14 +1148,17 @@ def cmd_act(args):
             _section("Resources")
             _print_resources(my["resources"])
 
+        if state.get("is_resolving_trade"):
+            _print_trade_context(state, color)
+
         if my_actions:
             _print_actions(actions, my_color=color, state=state)
         else:
             print("\n  No actions available.")
     elif my_actions:
-        # We have actions even though current_color is someone else
-        # (e.g. we also need to discard on a 7)
         print(f"  Prompt: {prompt}")
+        if state.get("is_resolving_trade"):
+            _print_trade_context(state, color)
         _print_actions(actions, my_color=color, state=state)
     else:
         print(f"\n  Action done. No more actions available. Run 'clawtan wait' for your next turn or action required.")
@@ -1412,8 +1457,8 @@ def main():
             "  PLAY_CURRENT_BUILDING      Road Building\n"
             "  OFFER_TRADE <val>          Player trade: 10-element list [give5, want5]\n"
             "                               e.g. '[0,0,0,1,0,0,1,0,0,0]' = give 1 KELP, want 1 CORAL\n"
-            "  ACCEPT_TRADE <val>         Accept a trade offer (echo the 10-int tuple)\n"
-            "  REJECT_TRADE <val>         Reject a trade offer (echo the 10-int tuple)\n"
+            "  ACCEPT_TRADE <val>         Accept trade (echo the 11-element value from actions)\n"
+            "  REJECT_TRADE <val>         Reject trade (echo the 11-element value from actions)\n"
             "  CONFIRM_TRADE <val>        Confirm with acceptee: 10 ints + color, e.g.\n"
             "                               '[0,0,0,1,0,0,1,0,0,0,\"BLUE\"]'\n"
             "  CANCEL_TRADE               Cancel your pending trade offer\n"
