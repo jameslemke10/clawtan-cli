@@ -7,12 +7,17 @@ by LLM agents. Session credentials are saved automatically on join.
 
 Typical agent flow:
     clawtan quick-join --name "LobsterBot"   # session saved to ~/.clawtan_session
+    clawtan whoami                           # verify correct session
     clawtan board            # once, to learn the map
     clawtan wait             # blocks until your turn
     clawtan act ROLL_THE_SHELLS
     clawtan act BUILD_TIDE_POOL 42
     clawtan act END_TIDE
     clawtan wait             # next turn...
+
+Between games:
+    clawtan clear-session                    # remove default session
+    clawtan clear-session --all              # remove ALL saved sessions
 
 Multi-player on one machine (each terminal):
     clawtan join <GAME_ID>                  # join, note your assigned color
@@ -152,7 +157,22 @@ def _save_session(game_id: str, token: str, color: str):
             json.dump(data, f)
     except OSError as e:
         print(f"Warning: could not save session to {path}: {e}", file=sys.stderr)
+
+    # Warn if the default session pointed at a different game (stale session)
     default = os.environ.get("CLAWTAN_SESSION_FILE") or os.path.expanduser("~/.clawtan_session")
+    try:
+        with open(default) as f:
+            prev = json.load(f)
+        prev_game = prev.get("GAME")
+        if prev_game and prev_game != game_id:
+            print(
+                f"  Note: overwriting previous session (game {prev_game})."
+                f" Run 'clawtan clear-session --game {prev_game}' to clean up old files.",
+                file=sys.stderr,
+            )
+    except (OSError, json.JSONDecodeError):
+        pass
+
     try:
         with open(default, "w") as f:
             json.dump(data, f)
@@ -179,24 +199,35 @@ def _find_session(game_hint: str | None = None, color_hint: str | None = None) -
             pass
 
     if (game_hint or color_hint) and os.path.isdir(_SESSIONS_DIR):
-        matches = []
+        matches = []  # list of (mtime, data) tuples
         for fname in os.listdir(_SESSIONS_DIR):
             if not fname.endswith(".json"):
                 continue
+            fpath = os.path.join(_SESSIONS_DIR, fname)
             try:
-                with open(os.path.join(_SESSIONS_DIR, fname)) as f:
+                with open(fpath) as f:
                     data = json.load(f)
                 if game_hint and data.get("GAME") != game_hint:
                     continue
                 if color_hint and data.get("COLOR") != color_hint:
                     continue
-                matches.append(data)
+                mtime = os.path.getmtime(fpath)
+                matches.append((mtime, data))
             except (OSError, json.JSONDecodeError):
                 continue
-        if len(matches) == 1:
-            return matches[0]
         if matches:
-            return matches[0]
+            # Sort by mtime descending so most recently written session wins
+            matches.sort(key=lambda m: m[0], reverse=True)
+            if len(matches) > 1:
+                chosen = matches[0][1]
+                print(
+                    f"Warning: {len(matches)} session files match hints"
+                    f" (game={game_hint}, color={color_hint})."
+                    f" Using most recent: {chosen.get('GAME')}_{chosen.get('COLOR')}."
+                    f" Pass --game and --color to be explicit.",
+                    file=sys.stderr,
+                )
+            return matches[0][1]
 
     default = os.path.expanduser("~/.clawtan_session")
     try:
@@ -238,6 +269,89 @@ def _require(name: str, val):
         )
         sys.exit(1)
     return val
+
+
+def cmd_whoami(args):
+    """Show the currently resolved session (game, color, token)."""
+    game, token, color = _resolve_session(
+        getattr(args, "game", None),
+        getattr(args, "token", None),
+        getattr(args, "color", None),
+    )
+    _header("CURRENT SESSION")
+    print(f"  Game:  {game or '(not set)'}")
+    print(f"  Color: {color or '(not set)'}")
+    print(f"  Token: {token[:12] + '...' if token and len(token) > 12 else token or '(not set)'}")
+
+    # Show where each value came from
+    sources = []
+    if getattr(args, "game", None) or getattr(args, "color", None):
+        sources.append("CLI flags")
+    for var in ("CLAWTAN_GAME", "CLAWTAN_TOKEN", "CLAWTAN_COLOR"):
+        if os.environ.get(var):
+            sources.append(f"env ${var}")
+    if not sources:
+        sources.append("session file")
+    print(f"  Source: {', '.join(sources)}")
+
+    if not (game and token and color):
+        print(
+            "\n  Session incomplete. Run 'clawtan quick-join' or pass --game/--token/--color.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def cmd_clear_session(args):
+    """Remove saved session files."""
+    removed = 0
+
+    if args.all:
+        # Remove all session files and the default
+        if os.path.isdir(_SESSIONS_DIR):
+            for fname in os.listdir(_SESSIONS_DIR):
+                if fname.endswith(".json"):
+                    os.remove(os.path.join(_SESSIONS_DIR, fname))
+                    removed += 1
+        default = os.path.expanduser("~/.clawtan_session")
+        if os.path.exists(default):
+            os.remove(default)
+            removed += 1
+        print(f"Cleared {removed} session file(s).")
+        return
+
+    # Clear a specific game, or just the default session
+    game_hint = args.game
+    color_hint = args.color
+
+    if game_hint or color_hint:
+        if os.path.isdir(_SESSIONS_DIR):
+            for fname in os.listdir(_SESSIONS_DIR):
+                if not fname.endswith(".json"):
+                    continue
+                fpath = os.path.join(_SESSIONS_DIR, fname)
+                try:
+                    with open(fpath) as f:
+                        data = json.load(f)
+                    if game_hint and data.get("GAME") != game_hint:
+                        continue
+                    if color_hint and data.get("COLOR") != color_hint:
+                        continue
+                    os.remove(fpath)
+                    removed += 1
+                except (OSError, json.JSONDecodeError):
+                    continue
+    else:
+        # No hints — clear the default session file
+        default = os.path.expanduser("~/.clawtan_session")
+        if os.path.exists(default):
+            os.remove(default)
+            removed += 1
+
+    if removed:
+        print(f"Cleared {removed} session file(s).")
+    else:
+        print("No matching session files found.")
 
 
 # ---------------------------------------------------------------------------
@@ -904,7 +1018,9 @@ def cmd_wait(args):
         if status.get("winning_color"):
             _header("GAME OVER")
             winner = status["winning_color"]
+            result = "won" if winner == color else "lost"
             print(f"  Winner: {winner}")
+            print(f"  You ({color}): {result}")
             try:
                 state = _get(f"/game/{game_id}")
                 colors = state.get("colors", [])
@@ -916,7 +1032,8 @@ def cmd_wait(args):
                     print(f"  {c}: {vp} VP{marker}")
             except (APIError, Exception):
                 pass
-            return
+            print("\n  Game is finished. Do not call 'wait' or 'act' again for this game.")
+            sys.exit(2)  # distinct exit code so agents can detect game-over
 
         # Progress messages (to stderr so they don't pollute the briefing)
         if not status.get("started"):
@@ -1007,6 +1124,8 @@ def cmd_wait(args):
     if robber:
         print(f"\n  Kraken: {robber}")
 
+    print("\n  >>> YOUR TURN: pick an action above and run 'clawtan act <ACTION> [VALUE]'.")
+
 
 def _print_roll_result(state: dict, pre_resources: dict | None):
     """Show dice result and per-player resource gains after a roll."""
@@ -1085,6 +1204,19 @@ def cmd_act(args):
                 current = state.get("current_color", "?")
                 actions = state.get("current_playable_actions", [])
 
+                # Primary diagnosis: is it even our turn?
+                if current != color:
+                    print(
+                        f"  It is NOT your turn. Current turn: {current} (you are {color}).",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "  >>> Run 'clawtan wait' to block until it is your turn.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+
+                # It is our turn but wrong action/value
                 available_types = set()
                 for a in actions:
                     if isinstance(a, list) and len(a) > 1:
@@ -1098,17 +1230,22 @@ def cmd_act(args):
                     )
                 else:
                     print(
-                        f"  '{args.action}' is not available right now.",
+                        f"  '{args.action}' is not available right now (prompt: {prompt}).",
                         file=sys.stderr,
                     )
 
                 print(f"  Current turn: {current} | Prompt: {prompt}", file=sys.stderr)
                 if actions:
                     _print_actions(actions, my_color=color, state=state)
-                print(
-                    "\n  Tip: run 'clawtan wait' to get a full turn briefing with available actions.",
-                    file=sys.stderr,
-                )
+                    print(
+                        "\n  >>> Pick an action above and run 'clawtan act <ACTION> [VALUE]'.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "\n  >>> No actions available. Run 'clawtan wait' for your next turn.",
+                        file=sys.stderr,
+                    )
             except Exception:
                 print(
                     "  Run 'clawtan wait' to see your available actions.",
@@ -1124,6 +1261,15 @@ def cmd_act(args):
 
     # Re-fetch state so the agent knows what to do next
     state = _get(f"/game/{game_id}")
+
+    # Check if this action ended the game (e.g. winning build)
+    winner = state.get("winning_color")
+    if winner:
+        result = "won" if winner == color else "lost"
+        print(f"\n  GAME OVER — Winner: {winner} (you {result})")
+        print("  Game is finished. Do not call 'wait' or 'act' again for this game.")
+        sys.exit(2)
+
     current_color = state.get("current_color")
 
     # After a roll, show the dice result and resource distribution
@@ -1153,15 +1299,18 @@ def cmd_act(args):
 
         if my_actions:
             _print_actions(actions, my_color=color, state=state)
+            print("\n  >>> YOUR TURN: pick an action above and run 'clawtan act <ACTION> [VALUE]'.")
         else:
             print("\n  No actions available.")
+            print("\n  >>> Run 'clawtan wait' to block until your next turn.")
     elif my_actions:
         print(f"  Prompt: {prompt}")
         if state.get("is_resolving_trade"):
             _print_trade_context(state, color)
         _print_actions(actions, my_color=color, state=state)
+        print("\n  >>> ACTION REQUIRED: pick an action above and run 'clawtan act <ACTION> [VALUE]'.")
     else:
-        print(f"\n  Action done. No more actions available. Run 'clawtan wait' for your next turn or action required.")
+        print("\n  >>> Turn complete. Run 'clawtan wait' to block until your next turn.")
 
 
 def cmd_status(args):
@@ -1528,6 +1677,38 @@ def main():
     p.add_argument("--game", help="Game ID (or set CLAWTAN_GAME)")
     p.add_argument("--since", type=int, default=0, help="Only messages with index >= N (default: 0)")
     p.set_defaults(func=cmd_chat_read)
+
+    # -- whoami --------------------------------------------------------
+    p = sub.add_parser(
+        "whoami",
+        help="Show the currently resolved session",
+        description=(
+            "Show which game, color, and token the CLI would use right now.\n"
+            "Useful for verifying you're pointed at the correct game before acting."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--game", help="Game ID (or set CLAWTAN_GAME)")
+    p.add_argument("--token", help="Auth token (or set CLAWTAN_TOKEN)")
+    p.add_argument("--color", help="Your color (or set CLAWTAN_COLOR)")
+    p.set_defaults(func=cmd_whoami)
+
+    # -- clear-session -------------------------------------------------
+    p = sub.add_parser(
+        "clear-session",
+        help="Remove saved session files",
+        description=(
+            "Remove saved session files to avoid stale credentials.\n"
+            "With no flags, removes the default ~/.clawtan_session file.\n"
+            "Use --game/--color to remove specific session files.\n"
+            "Use --all to remove every saved session."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--game", help="Only clear sessions for this game ID")
+    p.add_argument("--color", help="Only clear sessions for this color")
+    p.add_argument("--all", action="store_true", help="Remove ALL saved sessions")
+    p.set_defaults(func=cmd_clear_session)
 
     # -- Parse and run -------------------------------------------------
     args = parser.parse_args()
